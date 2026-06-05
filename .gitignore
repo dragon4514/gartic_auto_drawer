@@ -12,6 +12,9 @@ env/
 *.log
 *.tmp
 
+# Local canvas/profile calibration
+profiles/
+
 # Local preview / debug outputs
 *_preview_check.png
 *_current_preview.png

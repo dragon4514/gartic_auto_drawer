@@ -42,6 +42,12 @@ python gartic_auto_drawer.py
 5. 點 `Draw Fast`，在倒數期間切回 Gartic 視窗。
 6. 需要停止時按 `Esc` 或程式裡的 `STOP`。
 
+## 設定檔
+
+畫布 / 色盤 / 筆刷 / RGB 校正設定會儲存在專案資料夾內的 `profiles/gartic_profiles.json`。
+
+`profiles/` 資料夾會在第一次保存設定檔時自動產生，並已加入 `.gitignore`，避免把個人螢幕座標上傳到 GitHub。別人下載專案後，也會在自己的專案資料夾內產生自己的設定檔。
+
 ## 建議設定
 
 ### 穩定色盤上色
@@ -97,4 +103,5 @@ python gartic_auto_drawer.py
 
 - `gartic_auto_drawer.py`：主程式
 - `requirements.txt`：Python 依賴套件
+- `profiles/gartic_profiles.json`：本機自動產生的畫布設定檔，不會提交到 Git
 - `.gitignore`：忽略快取、虛擬環境與本機測試輸出

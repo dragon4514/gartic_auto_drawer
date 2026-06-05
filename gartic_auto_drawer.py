@@ -1,5 +1,16 @@
 import threading
 import time
+import sys
+import ctypes
+import json
+from pathlib import Path
+from ctypes import wintypes
+
+# 讓運算執行緒更常釋放 GIL，避免 Qt UI / 動畫在運算期間卡住。
+try:
+    sys.setswitchinterval(0.001)
+except Exception:
+    pass
 
 import cv2
 import mss
@@ -10,8 +21,8 @@ import pyautogui
 from PySide6.QtCore import QObject, Qt, Signal, QTimer, QSize, QRectF
 from PySide6.QtGui import QColor, QFont, QImage, QPixmap, QPainter, QPen, QLinearGradient, QBrush, QConicalGradient
 from PySide6.QtWidgets import (
-    QApplication, QAbstractButton, QAbstractSpinBox, QButtonGroup, QCheckBox, QDialog, QDoubleSpinBox, QFileDialog,
-    QFrame, QGraphicsDropShadowEffect, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
+    QApplication, QAbstractButton, QAbstractSpinBox, QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
+    QFrame, QGraphicsDropShadowEffect, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QListView, QMainWindow, QMessageBox,
     QPushButton, QRadioButton, QScrollArea, QSpinBox, QTextEdit, QVBoxLayout, QWidget
 )
 
@@ -44,6 +55,9 @@ DEFAULT_STROKE_STEP = 1
 DEFAULT_CUSTOM_COLORS = 48
 DEFAULT_SBR_STROKES = 300
 PREVIEW_MAX_SIZE = 620
+PROJECT_DIR = Path(__file__).resolve().parent
+PROFILE_DIR = PROJECT_DIR / "profiles"
+PROFILE_FILE = PROFILE_DIR / "gartic_profiles.json"
 GARTIC_BRUSH_PIXELS = {
     # Estimated brush diameters for Gartic hotkeys 1..5.
     1: 3,
@@ -75,8 +89,51 @@ FIXED_GARTIC_COLORS = [
 ]
 
 
+class _WinPOINT(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class _WinMSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", wintypes.HWND),
+        ("message", wintypes.UINT),
+        ("wParam", wintypes.WPARAM),
+        ("lParam", wintypes.LPARAM),
+        ("time", wintypes.DWORD),
+        ("pt", _WinPOINT),
+    ]
+
+
+WM_NCHITTEST = 0x0084
+HTTRANSPARENT = -1
+
+
 class StopDrawingException(Exception):
     pass
+
+
+class ResponsiveYield:
+    """Small cooperative yield helper for CPU-heavy Python loops.
+
+    The drawing app already runs heavy preparation in a background thread,
+    but pure-Python loops can still hold the GIL long enough to make Qt feel
+    frozen.  Calling maybe() periodically gives the UI thread a chance to
+    repaint timers, buttons, logs, and the computing animation.
+    """
+
+    def __init__(self, interval=0.015):
+        self.interval = float(interval)
+        self.last = time.perf_counter()
+
+    def maybe(self):
+        now = time.perf_counter()
+        if now - self.last >= self.interval:
+            time.sleep(0)
+            self.last = time.perf_counter()
+
+
+def ui_yield():
+    time.sleep(0)
 
 
 def capture_screen_rgb():
@@ -87,33 +144,106 @@ def capture_screen_rgb():
         return img_rgb, monitor["left"], monitor["top"]
 
 
+
 def detect_canvas(img_rgb):
-    # 找大片白色畫布
-    mask = cv2.inRange(
-        img_rgb,
-        np.array([245, 245, 245], dtype=np.uint8),
-        np.array([255, 255, 255], dtype=np.uint8)
-    )
+    """
+    Browser/adaptive Gartic canvas detector.
+    Works across different browsers, zoom levels, window sizes, and slightly
+    tinted Gartic canvases by looking for large low-saturation bright regions
+    instead of only pure white pixels.
+    """
+    h, w, _ = img_rgb.shape
+    screen_area = max(1, h * w)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    rgb_min = np.min(img_rgb, axis=2)
+    rgb_max = np.max(img_rgb, axis=2)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    masks = []
+    # White / pale blue / pale gray Gartic paper.
+    masks.append(((val >= 202) & (sat <= 80)).astype(np.uint8))
+    # Strict white fallback for browsers that render the canvas very cleanly.
+    masks.append(((rgb_min >= 235) & ((rgb_max - rgb_min) <= 45)).astype(np.uint8))
+    # Some browsers/subpixel scaling make the paper slightly darker.
+    masks.append(((val >= 185) & (sat <= 55)).astype(np.uint8))
 
-    best = None
-    best_area = 0
+    candidates = []
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31))
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 
-    for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-        area = w * h
-        ratio = w / max(h, 1)
+    for mask in masks:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        if area > 100000 and 1.2 < ratio < 2.5:
-            if area > best_area:
-                best_area = area
-                best = (x, y, x + w, y + h)
+        for contour in contours:
+            x, y, ww, hh = cv2.boundingRect(contour)
+            if ww <= 0 or hh <= 0:
+                continue
 
-    return best
+            area = ww * hh
+            ratio = ww / max(hh, 1)
+            if area < screen_area * 0.035:
+                continue
+            if ww < w * 0.22 or hh < h * 0.16:
+                continue
+            if not (1.05 <= ratio <= 2.85):
+                continue
+
+            fill = float(np.mean(mask[y:y + hh, x:x + ww] > 0))
+            if fill < 0.30:
+                continue
+
+            cx = x + ww / 2
+            cy = y + hh / 2
+            center_dx = abs(cx - w / 2) / max(w / 2, 1)
+            center_dy = abs(cy - h / 2) / max(h / 2, 1)
+            # Gartic canvas usually sits around the center and is much larger
+            # than ads / browser UI cards.  Keep this as a soft preference.
+            center_bonus = 1.0 - min(0.70, center_dx * 0.34 + center_dy * 0.20)
+            score = area * (0.55 + fill) * center_bonus
+            candidates.append((score, x, y, x + ww, y + hh, fill, ratio))
+
+    if not candidates:
+        return None
+
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    _score, x1, y1, x2, y2, _fill, _ratio = candidates[0]
+
+    # Refine edges inside the selected rectangle with a stricter paper mask.
+    crop = img_rgb[y1:y2, x1:x2]
+    if crop.size:
+        crop_hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+        c_sat = crop_hsv[:, :, 1]
+        c_val = crop_hsv[:, :, 2]
+        paper = ((c_val >= 205) & (c_sat <= 85)).astype(np.uint8)
+        paper = cv2.morphologyEx(
+            paper,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17)),
+            iterations=1,
+        )
+        contours, _ = cv2.findContours(paper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            # Select the largest inner paper-like component that still looks like a canvas.
+            best_inner = None
+            best_area = 0
+            for contour in contours:
+                x, y, ww, hh = cv2.boundingRect(contour)
+                area = ww * hh
+                ratio = ww / max(hh, 1)
+                if area > best_area and area > (x2 - x1) * (y2 - y1) * 0.35 and 1.05 <= ratio <= 2.85:
+                    best_area = area
+                    best_inner = (x, y, x + ww, y + hh)
+            if best_inner:
+                ix1, iy1, ix2, iy2 = best_inner
+                # Only accept refinement when it does not shrink suspiciously hard.
+                if (ix2 - ix1) >= (x2 - x1) * 0.70 and (iy2 - iy1) >= (y2 - y1) * 0.70:
+                    x1, y1, x2, y2 = x1 + ix1, y1 + iy1, x1 + ix2, y1 + iy2
+
+    return (int(x1), int(y1), int(x2), int(y2))
 
 
 def sort_centers_grid(centers):
@@ -138,6 +268,95 @@ def sort_centers_grid(centers):
         result.extend(row)
 
     return result
+
+
+def _dedupe_centers(centers, min_dist=14):
+    result = []
+    for cx, cy in sorted(centers, key=lambda p: (p[1], p[0])):
+        duplicate = False
+        for px, py in result:
+            if (px - cx) ** 2 + (py - cy) ** 2 < min_dist ** 2:
+                duplicate = True
+                break
+        if not duplicate:
+            result.append((int(cx), int(cy)))
+    return result
+
+
+def _cluster_axis(values, tolerance):
+    values = sorted([float(v) for v in values])
+    clusters = []
+    for value in values:
+        if not clusters or abs(np.mean(clusters[-1]) - value) > tolerance:
+            clusters.append([value])
+        else:
+            clusters[-1].append(value)
+    return [float(np.median(cluster)) for cluster in clusters]
+
+
+def _infer_palette_grid_from_candidates(centers, expected_cols=3, expected_rows=6):
+    if len(centers) < 10:
+        return []
+
+    xs = [p[0] for p in centers]
+    ys = [p[1] for p in centers]
+    span_x = max(xs) - min(xs) if xs else 1
+    span_y = max(ys) - min(ys) if ys else 1
+    x_tol = max(10, span_x / max(expected_cols * 2.2, 1))
+    y_tol = max(10, span_y / max(expected_rows * 2.2, 1))
+    col_centers = _cluster_axis(xs, x_tol)
+    row_centers = _cluster_axis(ys, y_tol)
+
+    # If contours detected only edges or missed white/black squares, infer the
+    # whole regular grid from median gaps.
+    if len(col_centers) >= expected_cols:
+        col_centers = sorted(col_centers)[:expected_cols]
+    elif len(col_centers) >= 2:
+        gap = float(np.median(np.diff(sorted(col_centers))))
+        start = min(col_centers)
+        col_centers = [start + i * gap for i in range(expected_cols)]
+    else:
+        return []
+
+    if len(row_centers) >= expected_rows:
+        # Pick the densest six top-to-bottom rows.
+        row_centers = sorted(row_centers)[:expected_rows]
+    elif len(row_centers) >= 2:
+        gap = float(np.median(np.diff(sorted(row_centers))))
+        start = min(row_centers)
+        row_centers = [start + i * gap for i in range(expected_rows)]
+    else:
+        return []
+
+    return [(int(round(x)), int(round(y))) for y in row_centers for x in col_centers]
+
+
+def _palette_fallback_centers(canvas, img_shape, side="left"):
+    x1, y1, x2, y2 = canvas
+    h, w, _ = img_shape
+    canvas_w = max(1, x2 - x1)
+    canvas_h = max(1, y2 - y1)
+
+    swatch_gap_x = max(30, int(round(canvas_w * 0.050)))
+    row_gap = max(34, int(round(canvas_h * 0.087)))
+    start_y = int(round(y1 + canvas_h * 0.125))
+
+    if side == "right":
+        base_x = int(round(x2 + canvas_w * 0.055))
+        xs = [base_x + i * swatch_gap_x for i in range(3)]
+    else:
+        xs = [
+            int(round(x1 - canvas_w * 0.155)),
+            int(round(x1 - canvas_w * 0.105)),
+            int(round(x1 - canvas_w * 0.055)),
+        ]
+
+    ys = [start_y + i * row_gap for i in range(6)]
+    centers = []
+    for y in ys:
+        for x in xs:
+            centers.append((int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1))))
+    return centers
 
 
 def sample_palette_color(img_rgb, cx, cy, radius=7):
@@ -185,53 +404,108 @@ def white_palette_indices(palette_colors, threshold=235):
     return set(np.where(white_mask)[0].tolist())
 
 
+def nearest_color_index_map(rgb, palette_colors):
+    """Memory-friendly nearest-color quantization for RGB images."""
+    colors = np.asarray(palette_colors, dtype=np.int32)
+    h, w = rgb.shape[:2]
+
+    if len(colors) == 0:
+        return np.full((h, w), -1, dtype=np.int16)
+
+    rgb_i = np.asarray(rgb, dtype=np.int32)
+    best_idx = np.zeros((h, w), dtype=np.int16)
+    best_dist = np.full((h, w), np.iinfo(np.int32).max, dtype=np.int32)
+    responsive = ResponsiveYield()
+
+    for color_idx, color in enumerate(colors):
+        responsive.maybe()
+        diff = rgb_i - color.reshape(1, 1, 3)
+        dist = np.sum(diff * diff, axis=2, dtype=np.int32)
+        better = dist < best_dist
+        if np.any(better):
+            best_dist[better] = dist[better]
+            best_idx[better] = color_idx
+
+    return best_idx
+
+
 def detect_palette(img_rgb, canvas):
     x1, y1, x2, y2 = canvas
     h, w, _ = img_rgb.shape
+    canvas_w = max(1, x2 - x1)
+    canvas_h = max(1, y2 - y1)
 
-    rx1 = max(0, x1 - 250)
-    rx2 = max(0, x1 - 25)
-    ry1 = max(0, y1 + 45)
-    ry2 = min(h, y1 + 500)
+    search_regions = []
+    # Gartic normally places the color palette on the left of the canvas.
+    search_regions.append((
+        max(0, int(x1 - canvas_w * 0.24)),
+        max(0, int(y1 + canvas_h * 0.04)),
+        min(w, int(x1 - canvas_w * 0.01)),
+        min(h, int(y1 + canvas_h * 0.82)),
+        "left",
+    ))
+    # Future / mirrored layouts or different browser scaling can place usable
+    # controls on the right; keep this as a secondary path.
+    search_regions.append((
+        max(0, int(x2 + canvas_w * 0.01)),
+        max(0, int(y1 + canvas_h * 0.04)),
+        min(w, int(x2 + canvas_w * 0.24)),
+        min(h, int(y1 + canvas_h * 0.82)),
+        "right",
+    ))
 
-    crop = img_rgb[ry1:ry2, rx1:rx2]
+    best_centers = []
+    best_side = "left"
+    best_score = -1
 
-    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-    edges = cv2.Canny(gray, 40, 130)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    for rx1, ry1, rx2, ry2, side in search_regions:
+        if rx2 <= rx1 + 20 or ry2 <= ry1 + 20:
+            continue
+        crop = img_rgb[ry1:ry2, rx1:rx2]
+        hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        color_mask = (((sat > 45) & (val > 45)) | (gray < 70) | (gray > 238)).astype(np.uint8) * 255
+        edges = cv2.Canny(gray, 35, 140)
+        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+        mixed = cv2.bitwise_or(edges, color_mask)
+        mixed = cv2.morphologyEx(mixed, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
 
-    centers = []
+        contours, _ = cv2.findContours(mixed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        centers = []
+        min_square = max(16, int(canvas_h * 0.028))
+        max_square = max(36, int(canvas_h * 0.095))
 
-    for c in contours:
-        x, y, ww, hh = cv2.boundingRect(c)
-
-        if 26 <= ww <= 76 and 26 <= hh <= 76 and abs(ww - hh) <= 18:
+        for contour in contours:
+            x, y, ww, hh = cv2.boundingRect(contour)
+            if ww < min_square or hh < min_square or ww > max_square or hh > max_square:
+                continue
+            if abs(ww - hh) > max(10, max(ww, hh) * 0.45):
+                continue
+            area = ww * hh
+            contour_area = abs(cv2.contourArea(contour))
+            if contour_area < area * 0.18:
+                continue
             cx = rx1 + x + ww // 2
             cy = ry1 + y + hh // 2
+            centers.append((cx, cy))
 
-            duplicate = False
-            for px, py in centers:
-                if abs(px - cx) < 16 and abs(py - cy) < 16:
-                    duplicate = True
-                    break
+        centers = _dedupe_centers(centers, min_dist=max(12, int(canvas_h * 0.030)))
+        inferred = _infer_palette_grid_from_candidates(centers)
+        score = len(inferred) * 10 + len(centers)
+        if score > best_score:
+            best_score = score
+            best_centers = inferred if len(inferred) >= 18 else centers
+            best_side = side
 
-            if not duplicate:
-                centers.append((cx, cy))
-
-    centers = sort_centers_grid(centers)
-
-    if len(centers) >= 18:
-        centers = centers[:18]
+    if len(best_centers) >= 18:
+        centers = sort_centers_grid(best_centers)[:18]
     else:
-        # Fixed 3 x 6 palette layout relative to the white drawing canvas.
-        xs = [x1 - 205, x1 - 140, x1 - 75]
-        ys = [y1 + 95 + i * 67 for i in range(6)]
-        centers = [(x, y) for y in ys for x in xs]
+        centers = _palette_fallback_centers(canvas, img_rgb.shape, side=best_side)
 
     palette = []
-
     for idx, (cx, cy) in enumerate(centers[:len(FIXED_GARTIC_COLORS)]):
         cx = int(np.clip(cx, 0, w - 1))
         cy = int(np.clip(cy, 0, h - 1))
@@ -249,92 +523,284 @@ def detect_brush_buttons(img_rgb, canvas):
     canvas_w = max(1, x2 - x1)
     canvas_h = max(1, y2 - y1)
 
-    rx1 = max(0, x1 - 40)
-    rx2 = min(w, x1 + min(canvas_w, 620))
-    ry1 = min(h, max(0, y2 + 25))
-    ry2 = min(h, y2 + 220)
+    rx1 = max(0, int(x1 - canvas_w * 0.05))
+    rx2 = min(w, int(x1 + canvas_w * 0.78))
+    ry1 = min(h, max(0, int(y2 + canvas_h * 0.03)))
+    ry2 = min(h, int(y2 + canvas_h * 0.28))
 
     centers = []
 
-    if ry2 > ry1 + 40 and rx2 > rx1 + 120:
+    if ry2 > ry1 + 36 and rx2 > rx1 + 120:
         crop = img_rgb[ry1:ry2, rx1:rx2]
         gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-        gray = cv2.medianBlur(gray, 5)
+        gray_blur = cv2.medianBlur(gray, 5)
 
         circles = cv2.HoughCircles(
-            gray,
+            gray_blur,
             cv2.HOUGH_GRADIENT,
             dp=1.2,
-            minDist=max(28, int(canvas_w * 0.055)),
+            minDist=max(24, int(canvas_w * 0.045)),
             param1=80,
-            param2=18,
-            minRadius=max(10, int(canvas_w * 0.018)),
-            maxRadius=max(28, int(canvas_w * 0.055))
+            param2=15,
+            minRadius=max(8, int(canvas_h * 0.017)),
+            maxRadius=max(20, int(canvas_h * 0.055))
         )
 
         if circles is not None:
-            candidates = []
             for cx, cy, radius in np.round(circles[0]).astype(int):
                 gx = rx1 + cx
                 gy = ry1 + cy
-                if x1 - 20 <= gx <= x1 + 560 and y2 + 20 <= gy <= y2 + 210:
-                    candidates.append((gx, gy, radius))
+                if x1 - canvas_w * 0.08 <= gx <= x1 + canvas_w * 0.55 and y2 <= gy <= y2 + canvas_h * 0.25:
+                    centers.append((gx, gy))
 
-            groups = []
-            for candidate in sorted(candidates, key=lambda c: c[1]):
-                added = False
-                for group in groups:
-                    if abs(group[0][1] - candidate[1]) <= 24:
-                        group.append(candidate)
-                        added = True
-                        break
-                if not added:
-                    groups.append([candidate])
+        if len(centers) < 5:
+            edges = cv2.Canny(gray, 35, 130)
+            edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                x, y, ww, hh = cv2.boundingRect(contour)
+                if not (max(16, canvas_h * 0.025) <= ww <= max(50, canvas_h * 0.09)):
+                    continue
+                if not (max(16, canvas_h * 0.025) <= hh <= max(50, canvas_h * 0.09)):
+                    continue
+                if abs(ww - hh) > max(10, max(ww, hh) * 0.45):
+                    continue
+                centers.append((rx1 + x + ww // 2, ry1 + y + hh // 2))
 
-            groups = [sorted(group, key=lambda c: c[0]) for group in groups]
-            groups = sorted(groups, key=lambda group: (-len(group), group[0][0]))
+    centers = _dedupe_centers(centers, min_dist=max(18, int(canvas_w * 0.035)))
 
-            for group in groups:
-                if len(group) >= 5:
-                    centers = [(gx, gy) for gx, gy, _radius in group[:5]]
+    if len(centers) >= 5:
+        # Pick the densest row of five brush circles.
+        rows = []
+        for p in sorted(centers, key=lambda p: p[1]):
+            for row in rows:
+                if abs(np.mean([q[1] for q in row]) - p[1]) < max(20, canvas_h * 0.04):
+                    row.append(p)
                     break
+            else:
+                rows.append([p])
+        rows.sort(key=lambda row: (-len(row), np.mean([q[0] for q in row])))
+        centers = sorted(rows[0], key=lambda p: p[0])[:5]
 
     if len(centers) < 5:
-        # Fallback for the current Gartic layout: five brush circles below the canvas.
+        # Ratio fallback for the current Gartic layout.
         spacing = int(np.clip(canvas_w * 0.068, 32, 95))
         start_x = int(x1 + canvas_w * 0.043)
-        brush_y = int(min(h - 1, y2 + canvas_h * 0.15))
+        brush_y = int(min(h - 1, y2 + canvas_h * 0.145))
         centers = [(start_x + i * spacing, brush_y) for i in range(5)]
 
-    return centers[:5]
+    return [(int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1))) for x, y in centers[:5]]
+
+def _palette_xy_arrays(palette):
+    xs = []
+    ys = []
+    for item in palette or []:
+        try:
+            if isinstance(item, dict):
+                x, y = item.get("pos", (None, None))
+            else:
+                x, y = item
+            if x is not None and y is not None:
+                xs.append(float(x))
+                ys.append(float(y))
+        except Exception:
+            continue
+    return xs, ys
 
 
-def estimate_custom_rgb_controls(palette):
-    if len(palette) < 18:
+def estimate_custom_rgb_controls(palette, canvas=None):
+    """
+    Estimate Gartic custom RGB panel controls from detected palette.
+
+    swatch = the custom color rectangle below the 18-color palette.
+    inputs = R/G/B text fields after clicking the swatch.
+    These are also shown in Overlay and can be dragged for calibration.
+    """
+    if not palette or len(palette) < 6:
         return None
 
-    xs = [palette[i]["pos"][0] for i in range(3)]
-    ys = [palette[i * 3]["pos"][1] for i in range(6)]
-    col_gap = max(1, float(np.median(np.diff(sorted(xs)))))
-    row_gap = max(1, float(np.median(np.diff(sorted(ys)))))
+    xs, ys = _palette_xy_arrays(palette)
+    if len(xs) < 6 or len(ys) < 6:
+        return None
+
+    # The 18 swatches are normally 3 x 6.  Work with all detected points so
+    # different browser zoom / UI scaling still has a reasonable fallback.
+    uniq_x = sorted(xs)
+    uniq_y = sorted(ys)
+    col_gap = max(1.0, float(np.median(np.diff(uniq_x)))) if len(uniq_x) >= 2 else 42.0
+    # Robust row gap: palette has duplicate x values, so use row-like y clusters.
+    y_clusters = []
+    for y in sorted(ys):
+        for group in y_clusters:
+            if abs(np.mean(group) - y) < 18:
+                group.append(y)
+                break
+        else:
+            y_clusters.append([y])
+    row_centers = [float(np.mean(group)) for group in y_clusters]
+    row_gap = max(1.0, float(np.median(np.diff(sorted(row_centers))))) if len(row_centers) >= 2 else col_gap
+
     center_x = float(np.mean(xs))
-    last_y = float(ys[-1])
+    last_y = float(max(row_centers) if row_centers else max(ys))
 
     swatch = (
         int(round(center_x)),
-        int(round(last_y + row_gap * 1.20))
+        int(round(last_y + row_gap * 1.35))
     )
-    input_y = int(round(swatch[1] + row_gap * 3.50))
+
+    # When the RGB panel opens, the R/G/B inputs are horizontally aligned.
+    # This estimate is good enough to show draggable overlay handles; if the
+    # panel is visible during Auto Detect, detect_custom_rgb_controls() refines it.
+    input_y = int(round(swatch[1] + row_gap * 3.40))
+    input_gap = max(36.0, col_gap * 0.95)
     inputs = [
-        (int(round(center_x - col_gap * 0.60)), input_y),
-        (int(round(center_x + col_gap * 0.50)), input_y),
-        (int(round(center_x + col_gap * 1.60)), input_y),
+        (int(round(center_x - input_gap)), input_y),
+        (int(round(center_x)), input_y),
+        (int(round(center_x + input_gap)), input_y),
     ]
 
     return {
         "swatch": swatch,
         "inputs": inputs,
+        "source": "palette-estimate",
     }
+
+
+def normalize_custom_rgb_controls(controls):
+    if not controls:
+        return None
+    try:
+        swatch = controls.get("swatch")
+        inputs = list(controls.get("inputs") or [])
+        if not swatch or len(inputs) < 3:
+            return None
+        return {
+            "swatch": (int(swatch[0]), int(swatch[1])),
+            "inputs": [(int(x), int(y)) for x, y in inputs[:3]],
+            "source": controls.get("source", "manual"),
+        }
+    except Exception:
+        return None
+
+
+def offset_custom_rgb_controls(controls, dx, dy):
+    controls = normalize_custom_rgb_controls(controls)
+    if not controls:
+        return None
+    dx, dy = int(dx), int(dy)
+    sx, sy = controls["swatch"]
+    return {
+        "swatch": (sx + dx, sy + dy),
+        "inputs": [(x + dx, y + dy) for x, y in controls["inputs"]],
+        "source": controls.get("source", "offset"),
+    }
+
+
+def _find_rgb_input_row(img_rgb, search_rect, expected_y=None):
+    """Detect the three white RGB input boxes if the custom panel is open."""
+    if img_rgb is None or search_rect is None:
+        return None
+    h, w = img_rgb.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in search_rect]
+    x1 = int(np.clip(x1, 0, w - 1))
+    x2 = int(np.clip(x2, x1 + 1, w))
+    y1 = int(np.clip(y1, 0, h - 1))
+    y2 = int(np.clip(y2, y1 + 1, h))
+    crop = img_rgb[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+
+    # RGB text boxes are very light rectangles.  Use low saturation/high value
+    # instead of pure white so Windows/browser font smoothing does not break it.
+    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    mask = ((val > 218) & (sat < 55)).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 5), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    for c in contours:
+        x, y, ww, hh = cv2.boundingRect(c)
+        if 34 <= ww <= 95 and 18 <= hh <= 45 and 1.25 <= ww / max(hh, 1) <= 4.5:
+            gx = x1 + x + ww // 2
+            gy = y1 + y + hh // 2
+            candidates.append((gx, gy, ww, hh))
+
+    if len(candidates) < 3:
+        return None
+
+    rows = []
+    for cand in sorted(candidates, key=lambda p: p[1]):
+        added = False
+        for row in rows:
+            if abs(np.mean([q[1] for q in row]) - cand[1]) <= 18:
+                row.append(cand)
+                added = True
+                break
+        if not added:
+            rows.append([cand])
+
+    best = None
+    best_score = -1e18
+    for row in rows:
+        row = sorted(row, key=lambda p: p[0])
+        if len(row) < 3:
+            continue
+        # Choose the most evenly spaced three in this row.
+        for i in range(0, len(row) - 2):
+            trio = row[i:i + 3]
+            gaps = [trio[1][0] - trio[0][0], trio[2][0] - trio[1][0]]
+            if min(gaps) < 22 or max(gaps) > 115:
+                continue
+            yavg = float(np.mean([p[1] for p in trio]))
+            evenness = -abs(gaps[0] - gaps[1])
+            y_score = -abs(yavg - expected_y) if expected_y is not None else yavg * 0.05
+            score = evenness + y_score
+            if score > best_score:
+                best_score = score
+                best = [(int(p[0]), int(p[1])) for p in trio]
+
+    return best
+
+
+def detect_custom_rgb_controls(img_rgb, canvas=None, palette=None):
+    """
+    Detect/estimate Custom RGB controls.
+    If the RGB panel is visible, refine the R/G/B input positions by OpenCV.
+    Otherwise return a draggable palette-based estimate.
+    """
+    fallback = estimate_custom_rgb_controls(palette, canvas)
+    if img_rgb is None or fallback is None:
+        return fallback
+
+    h, w = img_rgb.shape[:2]
+    xs, ys = _palette_xy_arrays(palette)
+    if not xs or not ys:
+        return fallback
+
+    center_x = float(np.mean(xs))
+    last_y = float(max(ys))
+    row_gap = max(36.0, float(np.median(np.diff(sorted(set(int(round(y)) for y in ys)))))) if len(set(int(round(y)) for y in ys)) >= 2 else 46.0
+
+    sx, sy = fallback["swatch"]
+    expected_input_y = fallback["inputs"][0][1]
+    search_rect = (
+        int(center_x - row_gap * 3.2),
+        int(last_y + row_gap * 0.65),
+        int(center_x + row_gap * 3.6),
+        int(min(h, last_y + row_gap * 6.8)),
+    )
+    inputs = _find_rgb_input_row(img_rgb, search_rect, expected_y=expected_input_y)
+
+    if inputs:
+        return {
+            "swatch": (int(sx), int(sy)),
+            "inputs": inputs,
+            "source": "opencv-rgb-inputs",
+        }
+
+    return fallback
 
 
 def resize_keep_aspect(img_rgba, max_w, max_h):
@@ -358,11 +824,7 @@ def image_to_palette_map(img_rgba, palette_colors, max_w, max_h, skip_white=True
     img = resize_keep_aspect(img_rgba, max_w, max_h)
     rgb, alpha = pil_rgb_alpha_arrays(img, dtype=np.int32)
 
-    pal = np.asarray(palette_colors, dtype=np.int32)
-
-    diff = rgb[:, :, None, :] - pal[None, None, :, :]
-    dist = np.sum(diff * diff, axis=3)
-    idx = np.argmin(dist, axis=2).astype(np.int16)
+    idx = nearest_color_index_map(rgb, palette_colors)
 
     skip = alpha < 40
 
@@ -434,8 +896,10 @@ def detect_eye_detail_mask(rgb, alpha):
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(candidate, 8)
     keep = np.zeros((h, w), dtype=np.uint8)
     max_area = max(6, int(h * w * 0.010))
+    responsive = ResponsiveYield()
 
     for label in range(1, num_labels):
+        responsive.maybe()
         x, y, ww, hh, area = stats[label]
         cx, cy = centroids[label]
 
@@ -485,14 +949,29 @@ def image_to_eye_detail_map(img_rgba, palette_colors, max_w, max_h):
     if not np.any(mask):
         return np.full(rgb.shape[:2], -1, dtype=np.int16), img.size
 
-    colors = np.asarray(palette_colors, dtype=np.int32)
-    rgb_i = rgb.astype(np.int32)
-    diff = rgb_i[:, :, None, :] - colors[None, None, :, :]
-    dist = np.sum(diff * diff, axis=3)
-    idx = np.argmin(dist, axis=2).astype(np.int16)
+    idx = nearest_color_index_map(rgb, palette_colors)
     idx[~mask] = -1
     idx[alpha < 40] = -1
     return idx, img.size
+
+
+def resize_label_map_to_shape(label_map, target_shape, fill_value=-1):
+    """Resize/crop a label map to exactly match another map shape."""
+    target_h, target_w = int(target_shape[0]), int(target_shape[1])
+
+    if label_map.shape == (target_h, target_w):
+        return label_map
+
+    if target_h <= 0 or target_w <= 0:
+        return np.full((max(1, target_h), max(1, target_w)), fill_value, dtype=label_map.dtype)
+
+    resized = cv2.resize(
+        label_map.astype(np.float32),
+        (target_w, target_h),
+        interpolation=cv2.INTER_NEAREST
+    )
+    return np.rint(resized).astype(label_map.dtype)
+
 
 def background_white_mask(rgb, alpha, very_white_threshold=248, chroma_limit=18):
     """
@@ -578,10 +1057,7 @@ def image_to_custom_rgb_map(img_rgba, max_w, max_h, color_count=24, skip_white=T
     )
 
     centers_i = np.clip(np.round(centers), 0, 255).astype(np.int32)
-    rgb_i = rgb_smooth.astype(np.int32)
-    diff = rgb_i[:, :, None, :] - centers_i[None, None, :, :]
-    dist = np.sum(diff * diff, axis=3)
-    idx = np.argmin(dist, axis=2).astype(np.int16)
+    idx = nearest_color_index_map(rgb_smooth, centers_i)
     idx[skip] = -1
 
     # 只有低色數才做 medianBlur；48 色高還原時不抹細節。
@@ -611,7 +1087,10 @@ def image_to_custom_rgb_map(img_rgba, max_w, max_h, color_count=24, skip_white=T
 def remove_small_color_regions(color_map, palette_size, min_area):
     cleaned = np.full(color_map.shape, -1, dtype=np.int16)
 
+    responsive = ResponsiveYield()
+
     for color_idx in range(palette_size):
+        responsive.maybe()
         mask = (color_map == color_idx).astype(np.uint8)
         if not np.any(mask):
             continue
@@ -638,6 +1117,7 @@ def solidify_color_map(color_map, palette_size, max_hole_area=12):
     if not np.any(invalid):
         return result
 
+    responsive = ResponsiveYield()
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(invalid, 8)
     max_hole_area = max(1, int(max_hole_area))
     kernel = np.ones((3, 3), np.uint8)
@@ -674,11 +1154,7 @@ def image_to_cartoon_color_map(img_rgba, palette_colors, max_w, max_h, skip_whit
     img = resize_keep_aspect(img_rgba, max_w, max_h)
     rgb, alpha = pil_rgb_alpha_arrays(img, dtype=np.uint8)
     rgb = cv2.bilateralFilter(rgb, 7, 45, 45)
-    pal = np.asarray(palette_colors, dtype=np.int32)
-    rgb_i = rgb.astype(np.int32)
-    diff = rgb_i[:, :, None, :] - pal[None, None, :, :]
-    dist = np.sum(diff * diff, axis=3)
-    idx = np.argmin(dist, axis=2).astype(np.int16)
+    idx = nearest_color_index_map(rgb, palette_colors)
 
     skip = alpha < 40
 
@@ -948,7 +1424,10 @@ def image_to_sbr_strokes(img_rgba, max_w, max_h, palette_colors, stroke_count=30
     ]
     stop_error = 140 if brush_px <= 3 else 260
 
+    responsive = ResponsiveYield()
+
     for _iteration in range(stroke_count):
+        responsive.maybe()
         diff = target.astype(np.int16) - canvas.astype(np.int16)
         err = np.sum(diff * diff, axis=2).astype(np.float32)
         err[skip] = 0
@@ -1025,6 +1504,7 @@ def image_to_sbr_strokes(img_rgba, max_w, max_h, palette_colors, stroke_count=30
 
 
 def zhang_suen_thinning(mask):
+    responsive = ResponsiveYield()
     img = (mask > 0).astype(np.uint8)
     changed = True
 
@@ -1036,6 +1516,8 @@ def zhang_suen_thinning(mask):
             h, w = img.shape
 
             for y in range(1, h - 1):
+                if y % 12 == 0:
+                    responsive.maybe()
                 for x in range(1, w - 1):
                     if img[y, x] == 0:
                         continue
@@ -1082,6 +1564,7 @@ def zhang_suen_thinning(mask):
 
 
 def trace_skeleton_strokes(skeleton, min_points=4):
+    responsive = ResponsiveYield()
     points = set(map(tuple, np.argwhere(skeleton > 0)))
     neighbor_offsets = [
         (-1, -1), (-1, 0), (-1, 1),
@@ -1133,6 +1616,7 @@ def trace_skeleton_strokes(skeleton, min_points=4):
         return path
 
     for node in nodes:
+        responsive.maybe()
         for nxt in neighbors(node):
             if edge_key(node, nxt) in visited_edges:
                 continue
@@ -1141,6 +1625,7 @@ def trace_skeleton_strokes(skeleton, min_points=4):
                 strokes.append([(x, y) for y, x in path])
 
     for point in points:
+        responsive.maybe()
         unvisited = [
             nxt for nxt in neighbors(point)
             if edge_key(point, nxt) not in visited_edges
@@ -1227,8 +1712,10 @@ def optimize_stroke_order(strokes):
     start_idx = remaining.pop(start_pos)
     ordered = [strokes[start_idx]]
     current_end = ordered[-1][-1]
+    responsive = ResponsiveYield()
 
     while remaining:
+        responsive.maybe()
         best_pos = 0
         best_reverse = False
         best_dist = float("inf")
@@ -1361,79 +1848,100 @@ def color_map_to_gartic_preview(
     h, w = color_map.shape
     preview_w = (w - 1) * cell_step_px + brush_px if w > 0 else brush_px
     preview_h = (h - 1) * cell_step_px + brush_px if h > 0 else brush_px
-    preview = Image.new("RGB", (preview_w, preview_h), "white")
-    draw = ImageDraw.Draw(preview)
+    preview = np.full((preview_h, preview_w, 3), 255, dtype=np.uint8)
 
-    if use_contour:
-        runs_by_color, _pixel_counts = build_color_runs_contour(
-            color_map,
-            len(palette_colors),
-            brush_px=brush_px,
-            bridge_gap=bridge_gap,
-            optimize=False
-        )
-    else:
-        runs_by_color, _pixel_counts = build_color_runs(color_map, len(palette_colors), bridge_gap=bridge_gap)
-    # 預覽也用實際繪製順序：亮色先、暗色最後，避免線條被蓋掉。
+    if not palette_colors:
+        return Image.fromarray(preview, "RGB")
+
+    display_map = color_map
+    bridge_gap = max(0, int(bridge_gap))
+
+    if use_contour or bridge_gap > 0:
+        display_map = np.full(color_map.shape, -1, dtype=np.int16)
+        epsilon_factor = 0.0025 if brush_px <= 3 else 0.0045 if brush_px <= 9 else 0.0065
+        min_area = max(4, int(brush_px * brush_px * 0.75))
+        responsive = ResponsiveYield()
+
+        for color_idx in range(len(palette_colors)):
+            responsive.maybe()
+            mask = (color_map == color_idx).astype(np.uint8)
+
+            if not np.any(mask):
+                continue
+
+            if bridge_gap > 0:
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+            if use_contour:
+                mask = contour_simplify_mask(mask, min_area=min_area, epsilon_factor=epsilon_factor)
+
+            display_map[mask > 0] = color_idx
+
     color_order = color_draw_order(palette_colors)
+    center_w = (w - 1) * cell_step_px + 1 if w > 0 else 1
+    center_h = (h - 1) * cell_step_px + 1 if h > 0 else 1
+    offset = max(0, brush_px // 2)
+    kernel_size = max(1, brush_px)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    responsive = ResponsiveYield()
 
-    radius = brush_px / 2
+    def paint_cell_mask(cell_mask, color):
+        if not np.any(cell_mask):
+            return
+
+        if cell_step_px == 1:
+            centers = (cell_mask.astype(np.uint8) * 255)
+        else:
+            centers = cv2.resize(
+                (cell_mask.astype(np.uint8) * 255),
+                (center_w, center_h),
+                interpolation=cv2.INTER_NEAREST
+            )
+
+        layer = np.zeros((preview_h, preview_w), dtype=np.uint8)
+        y2 = min(preview_h, offset + centers.shape[0])
+        x2 = min(preview_w, offset + centers.shape[1])
+        layer[offset:y2, offset:x2] = centers[:y2 - offset, :x2 - offset]
+
+        if brush_px > 1:
+            layer = cv2.dilate(layer, kernel, iterations=1)
+
+        preview[layer > 0] = color
+
+    def paint_spiral_path(path, color):
+        if not path:
+            return
+
+        layer = np.zeros((preview_h, preview_w), dtype=np.uint8)
+        points = np.asarray(
+            [
+                (
+                    int(round(px * cell_step_px + offset)),
+                    int(round(py * cell_step_px + offset))
+                )
+                for px, py in path
+            ],
+            dtype=np.int32
+        )
+
+        if len(points) == 1:
+            cv2.circle(layer, tuple(points[0]), max(1, brush_px // 2), 255, thickness=-1)
+        else:
+            cv2.polylines(layer, [points.reshape((-1, 1, 2))], False, 255, thickness=brush_px, lineType=cv2.LINE_AA)
+
+        preview[layer > 0] = color
 
     for color_idx in color_order:
+        responsive.maybe()
         color = tuple(int(v) for v in palette_colors[color_idx])
 
         if spiral_paths_by_color is not None and color_idx < len(spiral_paths_by_color):
             for path in spiral_paths_by_color[color_idx]:
-                if len(path) == 1:
-                    px, py = path[0]
-                    cx = px * cell_step_px + radius
-                    cy = py * cell_step_px + radius
-                    draw.ellipse(
-                        (cx - radius, cy - radius, cx + radius, cy + radius),
-                        fill=color
-                    )
-                    continue
+                paint_spiral_path(path, color)
 
-                if len(path) >= 2:
-                    points = [
-                        (
-                            px * cell_step_px + radius,
-                            py * cell_step_px + radius
-                        )
-                        for px, py in path
-                    ]
-                    draw.line(points, fill=color, width=brush_px)
-                    for px, py in (path[0], path[-1]):
-                        cx = px * cell_step_px + radius
-                        cy = py * cell_step_px + radius
-                        draw.ellipse(
-                            (cx - radius, cy - radius, cx + radius, cy + radius),
-                            fill=color
-                        )
+        paint_cell_mask(display_map == color_idx, color)
 
-        for run in runs_by_color[color_idx]:
-            y, start, end, _reverse = normalize_run(run)
-            sx = start * cell_step_px + radius
-            ex = (end - 1) * cell_step_px + radius
-            sy = y * cell_step_px + radius
-
-            if end - start <= 1:
-                draw.ellipse(
-                    (sx - radius, sy - radius, sx + radius, sy + radius),
-                    fill=color
-                )
-            else:
-                draw.line((sx, sy, ex, sy), fill=color, width=brush_px)
-                draw.ellipse(
-                    (sx - radius, sy - radius, sx + radius, sy + radius),
-                    fill=color
-                )
-                draw.ellipse(
-                    (ex - radius, sy - radius, ex + radius, sy + radius),
-                    fill=color
-                )
-
-    return preview
+    return Image.fromarray(preview, "RGB")
 
 
 def compose_canvas_preview(content, canvas_w, canvas_h):
@@ -1497,19 +2005,24 @@ def select_gartic_brush(brush_key, brush_positions=None, stop_event=None):
 def set_custom_rgb_color(rgb, controls, stop_event=None):
     raise_if_stopped(stop_event)
 
+    controls = normalize_custom_rgb_controls(controls)
     if not controls:
-        raise RuntimeError("尚未取得 RGB 面板位置，請先 Auto Detect，並確認自訂色面板位置沒有被遮擋。")
+        raise RuntimeError("尚未取得 RGB 面板位置，請先 Auto Detect，或用 Overlay 拖動校正 RGB / R / G / B 座標。")
+
+    inputs = controls.get("inputs") or []
+    if len(inputs) < 3:
+        raise RuntimeError("RGB 輸入框座標不足，請用 Overlay 拖動校正 R/G/B 三個輸入框。")
 
     pyautogui.click(*controls["swatch"])
-    time.sleep(0.18)
+    time.sleep(0.16)
 
-    for pos, value in zip(controls["inputs"], rgb):
+    for pos, value in zip(inputs[:3], rgb):
         raise_if_stopped(stop_event)
         pyautogui.click(*pos)
-        time.sleep(0.03)
+        time.sleep(0.025)
         pyautogui.hotkey("ctrl", "a")
         pyautogui.write(str(int(np.clip(value, 0, 255))), interval=0)
-        time.sleep(0.04)
+        time.sleep(0.035)
 
     raise_if_stopped(stop_event)
 
@@ -1537,12 +2050,15 @@ def draw_stroke_path(points, move_seconds, stop_event=None):
 
 
 def build_color_runs(color_map, palette_size, bridge_gap=0):
+    responsive = ResponsiveYield()
     runs_by_color = [[] for _ in range(palette_size)]
     pixel_counts = [0 for _ in range(palette_size)]
     draw_h, draw_w = color_map.shape
     bridge_gap = max(0, int(bridge_gap))
 
     for y in range(draw_h):
+        if y % 12 == 0:
+            responsive.maybe()
         row = color_map[y]
         x = 0
 
@@ -1595,6 +2111,7 @@ def build_color_runs(color_map, palette_size, bridge_gap=0):
 
 def extract_runs_from_binary_mask(mask, bridge_gap=0, min_run_len=1):
     """Convert a binary mask into horizontal Gartic fill runs."""
+    responsive = ResponsiveYield()
     mask = (mask > 0).astype(np.uint8)
     runs = []
     h, w = mask.shape
@@ -1602,6 +2119,8 @@ def extract_runs_from_binary_mask(mask, bridge_gap=0, min_run_len=1):
     min_run_len = max(1, int(min_run_len))
 
     for y in range(h):
+        if y % 12 == 0:
+            responsive.maybe()
         row = mask[y]
         x = 0
 
@@ -1791,8 +2310,10 @@ def component_to_spiral_path(component_mask, brush_px=3, cell_step_px=1, max_loo
     cur = component_mask.copy()
     path = []
     current_end = None
+    responsive = ResponsiveYield()
 
     for depth in range(int(max_loops)):
+        responsive.maybe()
         contours, _hierarchy = cv2.findContours(cur, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         contours = [c for c in contours if cv2.contourArea(c) >= 2.0]
         if not contours:
@@ -1836,13 +2357,16 @@ def build_spiral_fill_paths(color_map, palette_size, brush_px=3, cell_step_px=1,
     accepted_components = 0
     rejected_components = 0
     covered_pixels = 0
+    responsive = ResponsiveYield()
 
     for color_idx in range(palette_size):
+        responsive.maybe()
         mask = (color_map == color_idx).astype(np.uint8)
         if not np.any(mask):
             continue
         num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
         for label in range(1, num_labels):
+            responsive.maybe()
             area = int(stats[label, cv2.CC_STAT_AREA])
             if area < min_area:
                 rejected_components += 1
@@ -1888,6 +2412,7 @@ def build_spiral_fill_paths(color_map, palette_size, brush_px=3, cell_step_px=1,
 
 
 def optimize_spiral_path_order(paths):
+    responsive = ResponsiveYield()
     paths = [p for p in paths if len(p) >= 2]
     if len(paths) <= 2:
         return paths
@@ -1897,6 +2422,7 @@ def optimize_spiral_path_order(paths):
     ordered = [paths[first_idx]]
     current_end = ordered[-1][-1]
     while remaining:
+        responsive.maybe()
         best_pos = 0
         best_reverse = False
         best_dist = float("inf")
@@ -1994,8 +2520,10 @@ def optimize_run_order(runs):
     y, start, end, _reverse = normalize_run(runs[start_idx])
     ordered = [(y, start, end, False)]
     _current_start, current_end = run_endpoints(ordered[-1])
+    responsive = ResponsiveYield()
 
     while remaining:
+        responsive.maybe()
         best_pos = 0
         best_reverse = False
         best_dist = float("inf")
@@ -2133,6 +2661,7 @@ class UiSignals(QObject):
     draw_phase_changed = Signal(str)
     previewing_changed = Signal(bool)
     preview_ready = Signal(object, str)
+    overlay_ready = Signal(object, object, object, object)
     stop_requested = Signal()
 
 
@@ -2246,6 +2775,435 @@ class AnimatedActionButton(QPushButton):
         painter.drawText(rect, Qt.AlignCenter, self.text())
         painter.end()
 
+class DetectionOverlay(QWidget):
+    """Transparent always-on-top overlay for OpenCV detection debugging and manual calibration."""
+
+    detection_changed = Signal(object, object, object, object)
+    drag_finished = Signal()
+    calibration_saved = Signal(object, object, object, object)
+    calibration_cancelled = Signal()
+    profile_save_requested = Signal(object, object, object, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.canvas = None
+        self.palette = []
+        self.brush_positions = []
+        self.custom_rgb_controls = None
+        self._origin_x = 0
+        self._origin_y = 0
+        self._last_message = "OpenCV Detection Overlay"
+        self.edit_mode = False
+        self._drag_target = None
+        self._drag_last_global = None
+
+    def set_edit_mode(self, enabled):
+        self.edit_mode = bool(enabled)
+        # Normal overlay is click-through.  Edit mode receives the mouse so
+        # the detected canvas / palette / brush points can be dragged directly.
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, not self.edit_mode)
+        self.setCursor(Qt.OpenHandCursor if self.edit_mode else Qt.ArrowCursor)
+        self.update()
+
+    def _update_virtual_geometry(self):
+        app = QApplication.instance()
+        screens = app.screens() if app else []
+        if not screens:
+            return
+
+        left = min(screen.geometry().x() for screen in screens)
+        top = min(screen.geometry().y() for screen in screens)
+        right = max(screen.geometry().x() + screen.geometry().width() for screen in screens)
+        bottom = max(screen.geometry().y() + screen.geometry().height() for screen in screens)
+
+        self._origin_x = int(left)
+        self._origin_y = int(top)
+        self.setGeometry(int(left), int(top), int(right - left), int(bottom - top))
+
+    def set_detection(self, canvas, palette, brush_positions, custom_rgb_controls=None):
+        self.canvas = tuple(canvas) if canvas else None
+        self.palette = list(palette or [])
+        self.brush_positions = list(brush_positions or [])
+        self.custom_rgb_controls = normalize_custom_rgb_controls(custom_rgb_controls)
+        rgb_count = 0
+        if self.custom_rgb_controls:
+            rgb_count = 1 + len(self.custom_rgb_controls.get("inputs") or [])
+        self._last_message = (
+            f"Canvas: {self.canvas} | Palette: {len(self.palette)} | "
+            f"Brush: {len(self.brush_positions)} | RGB: {rgb_count}"
+        )
+        self._update_virtual_geometry()
+        self.update()
+
+    def show_overlay(self):
+        self._update_virtual_geometry()
+        self.show()
+        self.raise_()
+        self.update()
+
+    def nativeEvent(self, event_type, message):
+        """Windows-only selective click-through while edit mode is on.
+
+        The overlay is full-screen.  In edit mode it must receive clicks near
+        draggable handles, but clicks elsewhere should pass through to the main
+        Qt UI / browser instead of making buttons feel disabled.
+        """
+        if not self.edit_mode:
+            return False, 0
+
+        try:
+            if "windows" not in str(event_type).lower():
+                return False, 0
+
+            msg = _WinMSG.from_address(int(message))
+            if msg.message != WM_NCHITTEST:
+                return False, 0
+
+            gx = ctypes.c_short(int(msg.lParam) & 0xFFFF).value
+            gy = ctypes.c_short((int(msg.lParam) >> 16) & 0xFFFF).value
+
+            if self._hit_test(gx, gy) is None:
+                return True, HTTRANSPARENT
+
+        except Exception:
+            return False, 0
+
+        return False, 0
+
+    def _local_point(self, x, y):
+        return int(round(x - self._origin_x)), int(round(y - self._origin_y))
+
+    def _event_global_point(self, event):
+        p = event.position()
+        return int(round(p.x() + self._origin_x)), int(round(p.y() + self._origin_y))
+
+    def _point_near(self, x1, y1, x2, y2, radius):
+        return (x1 - x2) ** 2 + (y1 - y2) ** 2 <= radius ** 2
+
+    def _hud_rect(self):
+        hud_w = min(760, max(420, self.width() - 36))
+        hud_h = 120 if self.edit_mode else 74
+        return QRectF(18, 18, hud_w, hud_h)
+
+    def _action_button_rects(self):
+        if not self.edit_mode:
+            return {}
+        hud = self._hud_rect()
+        button_w = 96
+        profile_w = 120
+        button_h = 30
+        gap = 10
+        y = hud.bottom() - button_h - 12
+        cancel = QRectF(hud.right() - button_w - 14, y, button_w, button_h)
+        save = QRectF(cancel.left() - button_w - gap, y, button_w, button_h)
+        save_profile = QRectF(save.left() - profile_w - gap, y, profile_w, button_h)
+        return {"save_profile_button": save_profile, "save_button": save, "cancel_button": cancel}
+
+    def _hit_action_button(self, gx, gy):
+        lx, ly = self._local_point(gx, gy)
+        for name, rect in self._action_button_rects().items():
+            if rect.contains(float(lx), float(ly)):
+                return (name, None)
+        return None
+
+    def _hit_test(self, gx, gy):
+        action_target = self._hit_action_button(gx, gy)
+        if action_target is not None:
+            return action_target
+        # Custom RGB controls get highest priority because the R/G/B boxes can
+        # sit close to the palette area when the custom color panel is open.
+        if self.custom_rgb_controls:
+            try:
+                swatch = self.custom_rgb_controls.get("swatch")
+                if swatch and self._point_near(gx, gy, swatch[0], swatch[1], 34):
+                    return ("rgb_swatch", None)
+                for idx, pos in enumerate(self.custom_rgb_controls.get("inputs") or []):
+                    if self._point_near(gx, gy, pos[0], pos[1], 28):
+                        return ("rgb_input", idx)
+            except Exception:
+                pass
+
+        # Palette / brush get priority so they are still draggable even when
+        # close to the canvas box.
+        for idx, item in enumerate(self.palette):
+            try:
+                px, py = item.get("pos", (None, None)) if isinstance(item, dict) else item
+                if px is not None and py is not None and self._point_near(gx, gy, px, py, 26):
+                    return ("palette", idx)
+            except Exception:
+                pass
+
+        for idx, pos in enumerate(self.brush_positions):
+            try:
+                bx, by = pos
+                if self._point_near(gx, gy, bx, by, 30):
+                    return ("brush", idx)
+            except Exception:
+                pass
+
+        if self.canvas:
+            x1, y1, x2, y2 = self.canvas
+            left, right = min(x1, x2), max(x1, x2)
+            top, bottom = min(y1, y2), max(y1, y2)
+            near_border = (
+                left - 18 <= gx <= right + 18
+                and top - 18 <= gy <= bottom + 18
+                and (
+                    abs(gx - left) <= 18 or abs(gx - right) <= 18
+                    or abs(gy - top) <= 18 or abs(gy - bottom) <= 18
+                    or (left <= gx <= right and top <= gy <= bottom)
+                )
+            )
+            if near_border:
+                return ("canvas", None)
+
+        return None
+
+    def _apply_drag_delta(self, target, dx, dy):
+        kind, index = target
+        dx, dy = int(dx), int(dy)
+        if dx == 0 and dy == 0:
+            return
+
+        if kind == "canvas" and self.canvas:
+            x1, y1, x2, y2 = self.canvas
+            self.canvas = (x1 + dx, y1 + dy, x2 + dx, y2 + dy)
+
+        elif kind == "palette" and index is not None and 0 <= index < len(self.palette):
+            item = self.palette[index]
+            if isinstance(item, dict):
+                px, py = item.get("pos", (0, 0))
+                new_item = dict(item)
+                new_item["pos"] = (int(px + dx), int(py + dy))
+                self.palette[index] = new_item
+            else:
+                px, py = item
+                self.palette[index] = (int(px + dx), int(py + dy))
+
+        elif kind == "brush" and index is not None and 0 <= index < len(self.brush_positions):
+            bx, by = self.brush_positions[index]
+            self.brush_positions[index] = (int(bx + dx), int(by + dy))
+
+        elif kind == "rgb_swatch" and self.custom_rgb_controls:
+            sx, sy = self.custom_rgb_controls.get("swatch", (0, 0))
+            new_controls = dict(self.custom_rgb_controls)
+            new_controls["swatch"] = (int(sx + dx), int(sy + dy))
+            self.custom_rgb_controls = normalize_custom_rgb_controls(new_controls)
+
+        elif kind == "rgb_input" and self.custom_rgb_controls and index is not None:
+            inputs = list(self.custom_rgb_controls.get("inputs") or [])
+            if 0 <= index < len(inputs):
+                ix, iy = inputs[index]
+                inputs[index] = (int(ix + dx), int(iy + dy))
+                new_controls = dict(self.custom_rgb_controls)
+                new_controls["inputs"] = inputs
+                new_controls["source"] = "manual-overlay"
+                self.custom_rgb_controls = normalize_custom_rgb_controls(new_controls)
+
+        rgb_count = 0
+        if self.custom_rgb_controls:
+            rgb_count = 1 + len(self.custom_rgb_controls.get("inputs") or [])
+        self._last_message = (
+            f"Canvas: {self.canvas} | Palette: {len(self.palette)} | "
+            f"Brush: {len(self.brush_positions)} | RGB: {rgb_count}"
+        )
+        self.detection_changed.emit(self.canvas, self.palette, self.brush_positions, self.custom_rgb_controls)
+        self.update()
+
+    def mousePressEvent(self, event):
+        if not self.edit_mode or event.button() != Qt.LeftButton:
+            event.ignore()
+            return
+        gx, gy = self._event_global_point(event)
+        target = self._hit_test(gx, gy)
+        if target is None:
+            event.ignore()
+            return
+        if target[0] == "save_profile_button":
+            self.profile_save_requested.emit(self.canvas, self.palette, self.brush_positions, self.custom_rgb_controls)
+            event.accept()
+            return
+        if target[0] == "save_button":
+            self.calibration_saved.emit(self.canvas, self.palette, self.brush_positions, self.custom_rgb_controls)
+            event.accept()
+            return
+        if target[0] == "cancel_button":
+            self.calibration_cancelled.emit()
+            event.accept()
+            return
+        self._drag_target = target
+        self._drag_last_global = (gx, gy)
+        self.setCursor(Qt.ClosedHandCursor)
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if not self.edit_mode or self._drag_target is None or self._drag_last_global is None:
+            event.ignore()
+            return
+        gx, gy = self._event_global_point(event)
+        last_x, last_y = self._drag_last_global
+        self._apply_drag_delta(self._drag_target, gx - last_x, gy - last_y)
+        self._drag_last_global = (gx, gy)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if not self.edit_mode or event.button() != Qt.LeftButton:
+            event.ignore()
+            return
+        self._drag_target = None
+        self._drag_last_global = None
+        self.setCursor(Qt.OpenHandCursor)
+        self.drag_finished.emit()
+        event.accept()
+
+    def paintEvent(self, event):
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        # Small top-left HUD with Save / Cancel buttons in calibration mode.
+        hud_rect = self._hud_rect()
+        painter.setPen(QPen(QColor(125, 211, 252, 150), 1.0))
+        painter.setBrush(QColor(7, 11, 22, 184))
+        painter.drawRoundedRect(hud_rect, 12, 12)
+        painter.setPen(QColor("#E0F2FE"))
+        painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        title = "OpenCV Detect Overlay 偵測覆蓋層"
+        if self.edit_mode:
+            title += "  ·  拖動校正中"
+        painter.drawText(hud_rect.adjusted(14, 9, -14, -72 if self.edit_mode else -38), Qt.AlignLeft | Qt.AlignVCenter, title)
+        painter.setFont(QFont("Cascadia Mono", 9))
+        painter.setPen(QColor("#93C5FD"))
+        painter.drawText(hud_rect.adjusted(14, 35, -14, -42 if self.edit_mode else -8), Qt.AlignLeft | Qt.AlignVCenter, self._last_message)
+
+        if self.edit_mode:
+            painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+            painter.setPen(QColor("#BAE6FD"))
+            painter.drawText(
+                hud_rect.adjusted(14, 62, -205, -13),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                "拖動畫布框 / 色盤 / 筆刷 / RGB 標記，完成後可保存本次或存成設定檔。"
+            )
+            for name, rect in self._action_button_rects().items():
+                if name == "save_button":
+                    grad = QLinearGradient(rect.topLeft(), rect.topRight())
+                    grad.setColorAt(0.0, QColor("#22C55E"))
+                    grad.setColorAt(1.0, QColor("#0D9488"))
+                    label = "保存"
+                    border = QColor("#86EFAC")
+                elif name == "save_profile_button":
+                    grad = QLinearGradient(rect.topLeft(), rect.topRight())
+                    grad.setColorAt(0.0, QColor("#38BDF8"))
+                    grad.setColorAt(1.0, QColor("#6366F1"))
+                    label = "保存設定檔"
+                    border = QColor("#7DD3FC")
+                else:
+                    grad = QLinearGradient(rect.topLeft(), rect.topRight())
+                    grad.setColorAt(0.0, QColor("#475569"))
+                    grad.setColorAt(1.0, QColor("#1E293B"))
+                    label = "取消"
+                    border = QColor("#94A3B8")
+                painter.setPen(QPen(border, 1.2))
+                painter.setBrush(grad)
+                painter.drawRoundedRect(rect, 9, 9)
+                painter.setPen(QColor("#FFFFFF"))
+                painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                painter.drawText(rect, Qt.AlignCenter, label)
+
+        if self.canvas:
+            x1, y1, x2, y2 = self.canvas
+            lx1, ly1 = self._local_point(min(x1, x2), min(y1, y2))
+            lx2, ly2 = self._local_point(max(x1, x2), max(y1, y2))
+            rect = QRectF(lx1, ly1, lx2 - lx1, ly2 - ly1)
+
+            painter.setPen(QPen(QColor(56, 189, 248, 235), 4.0))
+            painter.setBrush(QColor(56, 189, 248, 22))
+            painter.drawRoundedRect(rect, 10, 10)
+
+            label_rect = QRectF(lx1, max(0, ly1 - 31), 260, 26)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(2, 132, 199, 210))
+            painter.drawRoundedRect(label_rect, 7, 7)
+            painter.setPen(QColor("#FFFFFF"))
+            painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            painter.drawText(label_rect, Qt.AlignCenter, f"Canvas 畫布 {lx2-lx1} x {ly2-ly1}")
+
+        # Palette swatches.
+        painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        for idx, item in enumerate(self.palette):
+            try:
+                px, py = item.get("pos", (None, None)) if isinstance(item, dict) else item
+                color = item.get("color", (56, 189, 248)) if isinstance(item, dict) else (56, 189, 248)
+                if px is None or py is None:
+                    continue
+                lx, ly = self._local_point(px, py)
+                size = 17
+                swatch_rect = QRectF(lx - size / 2, ly - size / 2, size, size)
+                painter.setPen(QPen(QColor("#FFFFFF"), 1.4))
+                painter.setBrush(QColor(int(color[0]), int(color[1]), int(color[2]), 220))
+                painter.drawRoundedRect(swatch_rect, 4, 4)
+                painter.setPen(QColor("#E0F2FE"))
+                painter.drawText(QRectF(lx + 10, ly - 10, 28, 20), Qt.AlignLeft | Qt.AlignVCenter, str(idx + 1))
+            except Exception:
+                continue
+
+        # Brush buttons.
+        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        for idx, pos in enumerate(self.brush_positions):
+            try:
+                bx, by = pos
+                lx, ly = self._local_point(bx, by)
+                radius = 14
+                painter.setPen(QPen(QColor(167, 139, 250, 235), 2.6))
+                painter.setBrush(QColor(167, 139, 250, 42))
+                painter.drawEllipse(QRectF(lx - radius, ly - radius, radius * 2, radius * 2))
+                painter.setPen(QColor("#FFFFFF"))
+                painter.drawText(QRectF(lx - radius, ly - radius, radius * 2, radius * 2), Qt.AlignCenter, str(idx + 1))
+            except Exception:
+                continue
+
+        # Custom RGB controls: swatch opener + R/G/B input fields.
+        if self.custom_rgb_controls:
+            try:
+                swatch = self.custom_rgb_controls.get("swatch")
+                inputs = list(self.custom_rgb_controls.get("inputs") or [])
+                if swatch:
+                    sx, sy = swatch
+                    lx, ly = self._local_point(sx, sy)
+                    rect = QRectF(lx - 36, ly - 17, 72, 34)
+                    painter.setPen(QPen(QColor(132, 204, 22, 235), 2.4))
+                    painter.setBrush(QColor(132, 204, 22, 42))
+                    painter.drawRoundedRect(rect, 7, 7)
+                    painter.setPen(QColor("#ECFCCB"))
+                    painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+                    painter.drawText(rect, Qt.AlignCenter, "RGB")
+
+                labels = ["R", "G", "B"]
+                colors = [QColor("#F87171"), QColor("#86EFAC"), QColor("#60A5FA")]
+                painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                for idx, pos in enumerate(inputs[:3]):
+                    ix, iy = pos
+                    lx, ly = self._local_point(ix, iy)
+                    rect = QRectF(lx - 18, ly - 13, 36, 26)
+                    painter.setPen(QPen(colors[idx], 2.2))
+                    painter.setBrush(QColor(colors[idx].red(), colors[idx].green(), colors[idx].blue(), 42))
+                    painter.drawRoundedRect(rect, 6, 6)
+                    painter.setPen(QColor("#FFFFFF"))
+                    painter.drawText(rect, Qt.AlignCenter, labels[idx])
+            except Exception:
+                pass
+
+        painter.end()
+
+
+
 class GarticQtDrawer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2264,6 +3222,14 @@ class GarticQtDrawer(QMainWindow):
         self.stop_event = threading.Event()
         self.keyboard_listener = None
         self.preview_windows = []
+        self.detection_overlay = DetectionOverlay()
+        self.detection_overlay.detection_changed.connect(self.apply_overlay_adjustment)
+        self.detection_overlay.drag_finished.connect(self.finish_overlay_adjustment)
+        self.detection_overlay.calibration_saved.connect(self.save_overlay_calibration)
+        self.detection_overlay.calibration_cancelled.connect(self.cancel_overlay_calibration)
+        self.detection_overlay.profile_save_requested.connect(self.save_overlay_profile)
+        self.overlay_calibration_backup = None
+        self.profiles = {}
         self.mode_value = MODE_SMART_LINE
         self.draw_start_time = None
         self.last_draw_elapsed = 0.0
@@ -2284,12 +3250,14 @@ class GarticQtDrawer(QMainWindow):
         self.signals.draw_phase_changed.connect(self.set_draw_phase)
         self.signals.previewing_changed.connect(self.set_previewing)
         self.signals.preview_ready.connect(self.show_preview)
+        self.signals.overlay_ready.connect(self.update_detection_overlay)
         self.signals.stop_requested.connect(self.request_stop)
 
         self.build_ui()
         self.apply_modern_theme()
+        self.load_profiles()
         self.start_global_hotkey()
-        self.log("=== Qt 右側 Log / 動態運算邊框版就緒 ===")
+        self.log("=== Qt OpenCV 自適應偵測 + Overlay + Custom RGB 校正版就緒 ===")
         self.log("緊急停止：按 STOP、Esc，或迅速將滑鼠移到螢幕角落")
 
     def configure_number_inputs(self):
@@ -2365,6 +3333,12 @@ class GarticQtDrawer(QMainWindow):
         self.detect_btn.setObjectName("secondaryButton")
         self.detect_btn.clicked.connect(self.auto_detect_thread)
         file_buttons.addWidget(self.detect_btn)
+
+        self.overlay_btn = QPushButton("Overlay 偵測/拖動校正")
+        self.overlay_btn.setObjectName("secondaryButton")
+        self.overlay_btn.setCheckable(True)
+        self.overlay_btn.clicked.connect(self.toggle_overlay_calibration)
+        file_buttons.addWidget(self.overlay_btn)
         header_layout.addLayout(file_buttons)
         root.addWidget(header_card)
 
@@ -2394,6 +3368,32 @@ class GarticQtDrawer(QMainWindow):
         self.detect_label.setObjectName("statusPill")
         quick_row.addWidget(self.detect_label, 1)
         quick_layout.addLayout(quick_row)
+
+        profile_row = QHBoxLayout()
+        profile_row.setSpacing(8)
+        profile_row.addWidget(QLabel("畫布設定檔"))
+        self.profile_combo = QComboBox()
+        self.profile_combo.setObjectName("profileCombo")
+        self.profile_combo.setMinimumWidth(190)
+        self.profile_combo.setMaxVisibleItems(6)
+        profile_view = QListView()
+        profile_view.setObjectName("profileComboPopup")
+        profile_view.setUniformItemSizes(True)
+        profile_view.setSpacing(1)
+        profile_view.setMouseTracking(True)
+        self.profile_combo.setView(profile_view)
+        profile_row.addWidget(self.profile_combo, 1)
+
+        self.load_profile_btn = QPushButton("載入")
+        self.load_profile_btn.setObjectName("secondaryButton")
+        self.load_profile_btn.clicked.connect(self.load_selected_profile)
+        profile_row.addWidget(self.load_profile_btn)
+
+        self.save_profile_btn = QPushButton("保存目前")
+        self.save_profile_btn.setObjectName("secondaryButton")
+        self.save_profile_btn.clicked.connect(self.save_current_profile_dialog)
+        profile_row.addWidget(self.save_profile_btn)
+        quick_layout.addLayout(profile_row)
         root.addWidget(quick_card)
 
         # Mode + advanced settings card
@@ -2739,6 +3739,60 @@ class GarticQtDrawer(QMainWindow):
                 border-color: #60A5FA;
                 background: #0F172A;
             }
+            QComboBox#profileCombo {
+                background: rgba(10, 19, 38, 0.98);
+                border: 1px solid rgba(51, 65, 85, 0.95);
+                border-radius: 10px;
+                padding: 5px 10px;
+                color: #E5E7EB;
+                min-height: 21px;
+                selection-background-color: rgba(56, 189, 248, 0.28);
+            }
+            QComboBox#profileCombo:hover {
+                border-color: rgba(56, 189, 248, 0.80);
+                background: rgba(15, 26, 45, 0.98);
+            }
+            QComboBox#profileCombo:focus,
+            QComboBox#profileCombo:on {
+                border-color: #60A5FA;
+                background: rgba(12, 22, 42, 1.0);
+            }
+            QComboBox#profileCombo:disabled {
+                background: #101827;
+                color: #64748B;
+                border-color: #1F2937;
+            }
+            QListView#profileComboPopup {
+                background: #071020;
+                border: 1px solid rgba(56, 189, 248, 0.32);
+                border-radius: 10px;
+                padding: 4px;
+                color: #DDE7F7;
+                outline: none;
+                selection-background-color: transparent;
+                selection-color: #FFFFFF;
+            }
+            QListView#profileComboPopup::item {
+                min-height: 22px;
+                padding: 4px 8px;
+                margin: 0px 1px;
+                border-radius: 7px;
+                color: #CBD5E1;
+                background: transparent;
+            }
+            QListView#profileComboPopup::item:hover {
+                color: #F8FAFC;
+                background: rgba(56, 189, 248, 0.12);
+                border: 1px solid rgba(56, 189, 248, 0.22);
+            }
+            QListView#profileComboPopup::item:selected {
+                color: #FFFFFF;
+                background: rgba(37, 99, 235, 0.35);
+                border: 1px solid rgba(125, 211, 252, 0.38);
+            }
+            QListView#profileComboPopup::item:selected:hover {
+                background: rgba(56, 189, 248, 0.22);
+            }
             QRadioButton#modeChip {
                 spacing: 8px;
                 padding: 6px 9px;
@@ -2836,6 +3890,11 @@ class GarticQtDrawer(QMainWindow):
             self.keyboard_listener = None
         try:
             pyautogui.mouseUp()
+        except Exception:
+            pass
+        try:
+            self.detection_overlay.hide()
+            self.detection_overlay.deleteLater()
         except Exception:
             pass
         event.accept()
@@ -2992,6 +4051,281 @@ class GarticQtDrawer(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "錯誤", f"無法載入圖片：{e}")
 
+    def apply_overlay_adjustment(self, canvas, palette, brush_positions, custom_rgb_controls=None):
+        # Called continuously while the user drags overlay markers.
+        self.canvas = tuple(canvas) if canvas else None
+        self.palette = list(palette or [])
+        self.brush_positions = list(brush_positions or [])
+        self.custom_rgb_controls = normalize_custom_rgb_controls(custom_rgb_controls)
+        if self.custom_rgb_controls is None and self.palette:
+            self.custom_rgb_controls = estimate_custom_rgb_controls(self.palette, self.canvas)
+        if self.canvas is not None:
+            x1, y1, x2, y2 = self.canvas
+            rgb_ok = "OK" if self.custom_rgb_controls else "--"
+            self._set_detect_status(
+                f"已校正 - 畫布: ({x1}, {y1}, {x2}, {y2}) | 色盤: {len(self.palette)} 色 | 筆刷: {len(self.brush_positions)} 顆 | RGB: {rgb_ok}",
+                "green"
+            )
+
+    def finish_overlay_adjustment(self):
+        if self.canvas is None:
+            return
+        x1, y1, x2, y2 = self.canvas
+        self.log(
+            f"Overlay 拖動校正完成：Canvas=({x1}, {y1}, {x2}, {y2}) | "
+            f"Palette={len(self.palette)} | Brush={len(self.brush_positions)} | "
+            f"RGB={self.custom_rgb_controls}"
+        )
+
+    def snapshot_detection_state(self):
+        palette_copy = []
+        for item in self.palette or []:
+            palette_copy.append(dict(item) if isinstance(item, dict) else item)
+        return {
+            "canvas": tuple(self.canvas) if self.canvas else None,
+            "palette": palette_copy,
+            "brush_positions": list(self.brush_positions or []),
+            "custom_rgb_controls": normalize_custom_rgb_controls(self.custom_rgb_controls),
+        }
+
+    def restore_detection_state(self, snapshot):
+        if not snapshot:
+            return
+        self.canvas = tuple(snapshot.get("canvas")) if snapshot.get("canvas") else None
+        self.palette = list(snapshot.get("palette") or [])
+        self.brush_positions = list(snapshot.get("brush_positions") or [])
+        self.custom_rgb_controls = normalize_custom_rgb_controls(snapshot.get("custom_rgb_controls"))
+        if self.custom_rgb_controls is None and self.palette:
+            self.custom_rgb_controls = estimate_custom_rgb_controls(self.palette, self.canvas)
+        if self.canvas is not None:
+            x1, y1, x2, y2 = self.canvas
+            rgb_ok = "OK" if self.custom_rgb_controls else "--"
+            self._set_detect_status(
+                f"已還原 - 畫布: ({x1}, {y1}, {x2}, {y2}) | 色盤: {len(self.palette)} 色 | 筆刷: {len(self.brush_positions)} 顆 | RGB: {rgb_ok}",
+                "green"
+            )
+
+    def profile_state_to_json(self, snapshot):
+        """Convert current detection/calibration data to JSON-safe profile data."""
+        snapshot = snapshot or self.snapshot_detection_state()
+        palette_data = []
+        for item in snapshot.get("palette") or []:
+            if isinstance(item, dict):
+                pos = item.get("pos", (0, 0))
+                color = item.get("color", (56, 189, 248))
+                palette_data.append({
+                    "pos": [int(pos[0]), int(pos[1])],
+                    "color": [int(color[0]), int(color[1]), int(color[2])],
+                })
+            else:
+                x, y = item
+                palette_data.append({"pos": [int(x), int(y)], "color": [56, 189, 248]})
+
+        controls = normalize_custom_rgb_controls(snapshot.get("custom_rgb_controls"))
+        if controls:
+            controls = {
+                "swatch": [int(controls["swatch"][0]), int(controls["swatch"][1])],
+                "inputs": [[int(x), int(y)] for x, y in controls.get("inputs", [])[:3]],
+                "source": controls.get("source", "profile"),
+            }
+
+        canvas = snapshot.get("canvas")
+        return {
+            "version": 1,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "canvas": [int(v) for v in canvas] if canvas else None,
+            "palette": palette_data,
+            "brush_positions": [[int(x), int(y)] for x, y in (snapshot.get("brush_positions") or [])],
+            "custom_rgb_controls": controls,
+        }
+
+    def profile_json_to_state(self, data):
+        if not isinstance(data, dict):
+            raise ValueError("設定檔格式錯誤")
+        canvas = data.get("canvas")
+        if canvas:
+            canvas = tuple(int(v) for v in canvas[:4])
+
+        palette = []
+        for item in data.get("palette") or []:
+            pos = item.get("pos", (0, 0)) if isinstance(item, dict) else item
+            color = item.get("color", (56, 189, 248)) if isinstance(item, dict) else (56, 189, 248)
+            palette.append({
+                "pos": (int(pos[0]), int(pos[1])),
+                "color": (int(color[0]), int(color[1]), int(color[2])),
+            })
+
+        brush_positions = [(int(x), int(y)) for x, y in (data.get("brush_positions") or [])]
+        controls = normalize_custom_rgb_controls(data.get("custom_rgb_controls"))
+        return {
+            "canvas": canvas,
+            "palette": palette,
+            "brush_positions": brush_positions,
+            "custom_rgb_controls": controls,
+        }
+
+    def load_profiles(self):
+        try:
+            if PROFILE_FILE.exists():
+                with PROFILE_FILE.open("r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    self.profiles = raw.get("profiles", raw if "profiles" not in raw else {})
+                else:
+                    self.profiles = {}
+            else:
+                self.profiles = {}
+        except Exception as e:
+            self.profiles = {}
+            self.log(f"設定檔讀取失敗：{e}")
+        self.refresh_profile_combo()
+
+    def write_profiles(self):
+        try:
+            data = {"version": 1, "profiles": self.profiles}
+            PROFILE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with PROFILE_FILE.open("w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            QMessageBox.critical(self, "設定檔錯誤", f"無法寫入設定檔：{e}")
+            raise
+
+    def refresh_profile_combo(self, select_name=None):
+        if not hasattr(self, "profile_combo"):
+            return
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        self.profile_combo.addItem("未選擇", "")
+        for name in sorted(self.profiles.keys()):
+            self.profile_combo.addItem(name, name)
+        if select_name:
+            idx = self.profile_combo.findData(select_name)
+            if idx >= 0:
+                self.profile_combo.setCurrentIndex(idx)
+        self.profile_combo.blockSignals(False)
+
+    def default_profile_name(self):
+        if self.canvas:
+            x1, y1, x2, y2 = self.canvas
+            return f"畫布 {abs(x2 - x1)}x{abs(y2 - y1)}"
+        return time.strftime("畫布設定 %m%d-%H%M")
+
+    def save_profile_with_name(self, name, snapshot=None):
+        name = str(name or "").strip()
+        if not name:
+            return False
+        snapshot = snapshot or self.snapshot_detection_state()
+        if not snapshot.get("canvas"):
+            QMessageBox.information(self, "尚未偵測", "目前沒有畫布座標可以保存，請先 Auto Detect 或完成 Overlay 校正。")
+            return False
+        self.profiles[name] = self.profile_state_to_json(snapshot)
+        self.write_profiles()
+        self.refresh_profile_combo(select_name=name)
+        self.log(f"畫布設定檔已保存：{name} → {PROFILE_FILE}")
+        return True
+
+    def save_current_profile_dialog(self):
+        if self.canvas is None:
+            QMessageBox.information(self, "尚未偵測", "請先 Auto Detect，或使用 Overlay 校正後再保存設定檔。")
+            return
+        current = self.profile_combo.currentData() if hasattr(self, "profile_combo") else ""
+        default_name = current or self.default_profile_name()
+        name, ok = QInputDialog.getText(self, "保存畫布設定檔", "設定檔名稱：", text=default_name)
+        if ok:
+            self.save_profile_with_name(name)
+
+    def save_overlay_profile(self, canvas=None, palette=None, brush_positions=None, custom_rgb_controls=None):
+        if canvas is not None:
+            self.apply_overlay_adjustment(canvas, palette, brush_positions, custom_rgb_controls)
+        snapshot = self.snapshot_detection_state()
+        default_name = self.default_profile_name()
+        # Overlay 是最上層視窗，先暫時隱藏，避免名稱輸入框被蓋住。
+        self.detection_overlay.hide()
+        name, ok = QInputDialog.getText(self, "保存畫布設定檔", "設定檔名稱：", text=default_name)
+        if not ok:
+            if self.overlay_btn.isChecked():
+                self.detection_overlay.show_overlay()
+            return
+        if self.save_profile_with_name(name, snapshot):
+            self.overlay_calibration_backup = None
+            self.close_overlay_calibration_ui()
+            self.log("Overlay 校正已保存為設定檔，可在快速控制的畫布設定檔直接載入。")
+        elif self.overlay_btn.isChecked():
+            self.detection_overlay.show_overlay()
+
+    def load_selected_profile(self):
+        if not hasattr(self, "profile_combo"):
+            return
+        name = self.profile_combo.currentData()
+        if not name:
+            QMessageBox.information(self, "尚未選擇", "請先選擇一個畫布設定檔。")
+            return
+        data = self.profiles.get(name)
+        if not data:
+            QMessageBox.warning(self, "找不到設定檔", f"找不到設定檔：{name}")
+            return
+        try:
+            state = self.profile_json_to_state(data)
+            self.restore_detection_state(state)
+            self.detection_overlay.set_detection(self.canvas, self.palette, self.brush_positions, self.custom_rgb_controls)
+            self.log(f"已載入畫布設定檔：{name}")
+        except Exception as e:
+            QMessageBox.critical(self, "載入失敗", f"設定檔載入失敗：{e}")
+
+    def close_overlay_calibration_ui(self):
+        self.detection_overlay.set_edit_mode(False)
+        self.detection_overlay.hide()
+        if hasattr(self, "overlay_btn"):
+            self.overlay_btn.blockSignals(True)
+            self.overlay_btn.setChecked(False)
+            self.overlay_btn.blockSignals(False)
+            self.overlay_btn.setText("Overlay 偵測/拖動校正")
+
+    def update_detection_overlay(self, canvas, palette, brush_positions, custom_rgb_controls=None):
+        self.detection_overlay.set_detection(canvas, palette, brush_positions, custom_rgb_controls)
+        if self.overlay_btn.isChecked():
+            self.detection_overlay.set_edit_mode(True)
+            self.detection_overlay.show_overlay()
+            self.overlay_btn.setText("校正中：看 Overlay 保存/取消")
+
+    def toggle_overlay_calibration(self, checked):
+        if checked:
+            if self.canvas is None:
+                QMessageBox.information(self, "尚未偵測", "請先按 Auto Detect，自動偵測畫布、色盤、筆刷與 RGB 位置。")
+                self.overlay_btn.setChecked(False)
+                return
+            self.overlay_calibration_backup = self.snapshot_detection_state()
+            self.detection_overlay.set_detection(self.canvas, self.palette, self.brush_positions, self.custom_rgb_controls)
+            self.detection_overlay.set_edit_mode(True)
+            self.detection_overlay.show_overlay()
+            self.overlay_btn.setText("校正中：看 Overlay 保存/取消")
+            self.log("Overlay 校正已啟用：請在 Overlay 上拖動，最後按保存、取消或保存設定檔。")
+        else:
+            # Main UI button acts as Cancel when closing calibration without pressing Save.
+            self.cancel_overlay_calibration()
+
+    def save_overlay_calibration(self, canvas=None, palette=None, brush_positions=None, custom_rgb_controls=None):
+        if canvas is not None:
+            self.apply_overlay_adjustment(canvas, palette, brush_positions, custom_rgb_controls)
+        self.overlay_calibration_backup = None
+        self.close_overlay_calibration_ui()
+        if self.canvas is not None:
+            x1, y1, x2, y2 = self.canvas
+            self.log(
+                f"Overlay 校正已保存：Canvas=({x1}, {y1}, {x2}, {y2}) | "
+                f"Palette={len(self.palette)} | Brush={len(self.brush_positions)} | RGB={self.custom_rgb_controls}"
+            )
+
+    def cancel_overlay_calibration(self):
+        if self.overlay_calibration_backup is not None:
+            self.restore_detection_state(self.overlay_calibration_backup)
+            self.detection_overlay.set_detection(self.canvas, self.palette, self.brush_positions, self.custom_rgb_controls)
+            self.log("Overlay 校正已取消，已還原到開啟校正前的位置。")
+        else:
+            self.log("Overlay 校正已關閉。")
+        self.overlay_calibration_backup = None
+        self.close_overlay_calibration_ui()
+
     def auto_detect_thread(self):
         if self.is_detecting:
             return
@@ -3018,10 +4352,15 @@ class GarticQtDrawer(QMainWindow):
 
             brush_positions = [(int(px + offset_x), int(py + offset_y)) for px, py in brush_positions]
 
+            # Custom RGB panel controls are first detected in screenshot coordinates,
+            # then shifted to screen coordinates like the palette / brush points.
+            rgb_controls = detect_custom_rgb_controls(img_rgb, canvas, palette)
+            rgb_controls = offset_custom_rgb_controls(rgb_controls, offset_x, offset_y)
+
             self.canvas = canvas_screen
             self.palette = palette
             self.brush_positions = brush_positions
-            self.custom_rgb_controls = estimate_custom_rgb_controls(self.palette)
+            self.custom_rgb_controls = rgb_controls or estimate_custom_rgb_controls(self.palette, self.canvas)
 
             self.signals.detect_status.emit(
                 f"已就緒 - 畫布: {self.canvas} | 色盤: {len(self.palette)} 色 | 筆刷: {len(self.brush_positions)} 顆",
@@ -3033,6 +4372,7 @@ class GarticQtDrawer(QMainWindow):
             self.log(f"抓取到筆刷按鈕數量：{len(self.brush_positions)} 顆")
             self.log(f"筆刷按鈕座標：{self.brush_positions}")
             self.log(f"RGB 面板座標：{self.custom_rgb_controls}")
+            self.signals.overlay_ready.emit(self.canvas, self.palette, self.brush_positions, self.custom_rgb_controls)
         except Exception as e:
             self.log(f"偵測過程中發生異常：{e}")
         finally:
@@ -3081,6 +4421,7 @@ class GarticQtDrawer(QMainWindow):
                 preview = compose_canvas_preview(content, canvas_w, canvas_h)
                 info = f"SBR 筆觸預覽 | 畫布: {canvas_w}x{canvas_h} | 圖像: {img_size[0]}x{img_size[1]} | 筆觸: {len(strokes)} | 筆刷鍵: {brush_key}"
             elif mode in (MODE_SMART_LINE, MODE_LINE, MODE_CLEAN_LINE, MODE_DARK_OUTLINE):
+                self.log("運算中：正在分析線稿，UI 已改成非阻塞模式。")
                 line_max_w = max(1, int(canvas_w * line_scale / 100))
                 line_max_h = max(1, int(canvas_h * line_scale / 100))
                 strokes, img_size = image_to_smart_line_strokes(self.image, line_max_w, line_max_h, detail=detail)
@@ -3088,6 +4429,7 @@ class GarticQtDrawer(QMainWindow):
                 preview = compose_canvas_preview(content, canvas_w, canvas_h)
                 info = f"整合線稿預覽 | 畫布: {canvas_w}x{canvas_h} | 圖像: {img_size[0]}x{img_size[1]} | 筆刷鍵: {brush_key} | 總筆畫: {len(strokes)}"
             elif mode in (MODE_PALETTE, MODE_CUSTOM_RGB):
+                self.log("運算中：正在量化色彩與排序路徑，UI 已改成非阻塞模式。")
                 color_max_w = max(1, int(canvas_w * line_scale / 100))
                 color_max_h = max(1, int(canvas_h * line_scale / 100))
                 cell_step_px = color_fill_step(mode, brush_px)
@@ -3115,6 +4457,7 @@ class GarticQtDrawer(QMainWindow):
                     eye_map, _eye_size = image_to_eye_detail_map(
                         self.image, mapping_colors, color_map.shape[1], color_map.shape[0]
                     )
+                    eye_map = resize_label_map_to_shape(eye_map, color_map.shape)
                     for wi in white_palette_indices(mapping_colors):
                         eye_map[eye_map == wi] = -1
                     eye_mask = eye_map >= 0
@@ -3210,11 +4553,16 @@ class GarticQtDrawer(QMainWindow):
 
         self.set_drawing(True)
         self.stop_event.clear()
-        threading.Thread(
-            target=self.draw_fast,
-            args=(cps, brush_key, skip_white, mode, detail, line_move_ms, line_gap_ms, line_scale, stroke_step, custom_colors, sbr_strokes, auto_black, eye_detail, spiral_fill),
-            daemon=True
-        ).start()
+
+        def _start_worker():
+            threading.Thread(
+                target=self.draw_fast,
+                args=(cps, brush_key, skip_white, mode, detail, line_move_ms, line_gap_ms, line_scale, stroke_step, custom_colors, sbr_strokes, auto_black, eye_detail, spiral_fill),
+                daemon=True
+            ).start()
+
+        # 先讓 Qt 有一個 event loop 週期更新按鈕/動畫，再開始重運算。
+        QTimer.singleShot(30, _start_worker)
 
     def wait_or_stop(self, seconds):
         end_time = time.time() + seconds
@@ -3244,6 +4592,7 @@ class GarticQtDrawer(QMainWindow):
             mapping_colors = palette_colors_for_mapping(palette_colors)
 
             if mode == MODE_SBR:
+                self.log("運算中：正在生成 SBR 筆觸序列，UI 已改成非阻塞模式。")
                 if not palette_positions:
                     self.log("錯誤：未偵測到有效色盤，取消 SBR 繪製。")
                     return
