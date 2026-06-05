@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.venv/
+venv/
+env/
+
+.vscode/
+.idea/
+
+*.log
+*.tmp
+
+# Local preview / debug outputs
+*_preview_check.png
+*_current_preview.png
+fed_palette_detail_preview.png
+sbr_preview_check.png
+color_fill_preview_check.png
+
+# OS files
+Thumbs.db
+.DS_Store
