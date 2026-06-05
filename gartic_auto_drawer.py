@@ -53,8 +53,14 @@ DEFAULT_LINE_GAP_MS = 0
 DEFAULT_LINE_SCALE = 85
 DEFAULT_STROKE_STEP = 1
 DEFAULT_CUSTOM_COLORS = 48
+MAX_CUSTOM_COLORS = 384
 DEFAULT_SBR_STROKES = 300
 PREVIEW_MAX_SIZE = 620
+PALETTE_SELECT_DELAY = 0.07
+PALETTE_DETAIL_SELECT_DELAY = 0.05
+CUSTOM_RGB_PANEL_DELAY = 0.20
+CUSTOM_RGB_INPUT_CLICK_DELAY = 0.035
+CUSTOM_RGB_INPUT_WRITE_DELAY = 0.045
 PROJECT_DIR = Path(__file__).resolve().parent
 PROFILE_DIR = PROJECT_DIR / "profiles"
 PROFILE_FILE = PROFILE_DIR / "gartic_profiles.json"
@@ -1010,7 +1016,7 @@ def image_to_custom_rgb_map(img_rgba, max_w, max_h, color_count=24, skip_white=T
     """
     高還原 Custom RGB：
     - 只移除邊界純白背景，不吃掉臉/衣服高光。
-    - 48 色時不做 label medianBlur，避免眼睛、嘴巴、細線被抹掉。
+    - 高色數時不做 label medianBlur，避免眼睛、嘴巴、細線被抹掉。
     - 小色塊清理改很保守，保留動漫圖細節。
     """
     img = resize_keep_aspect(img_rgba, max_w, max_h)
@@ -1034,7 +1040,7 @@ def image_to_custom_rgb_map(img_rgba, max_w, max_h, color_count=24, skip_white=T
     if len(pixels) == 0:
         return np.full(rgb.shape[:2], -1, dtype=np.int16), [], img.size
 
-    color_count = int(np.clip(color_count, 2, 64))
+    color_count = int(np.clip(color_count, 2, MAX_CUSTOM_COLORS))
     k = min(color_count, len(pixels))
 
     # 用隨機但固定 seed 的 sample，比 linspace 更不容易偏向圖片某一側。
@@ -1070,7 +1076,9 @@ def image_to_custom_rgb_map(img_rgba, max_w, max_h, color_count=24, skip_white=T
         idx[skip] = -1
 
     # 小區塊清理變保守，避免眼睛/嘴巴/髮絲被刪掉。
-    if color_count >= 40:
+    if color_count >= 128:
+        min_area = 1
+    elif color_count >= 40:
         min_area = 2
     elif color_count >= 32:
         min_area = 3
@@ -2014,15 +2022,15 @@ def set_custom_rgb_color(rgb, controls, stop_event=None):
         raise RuntimeError("RGB 輸入框座標不足，請用 Overlay 拖動校正 R/G/B 三個輸入框。")
 
     pyautogui.click(*controls["swatch"])
-    time.sleep(0.16)
+    time.sleep(CUSTOM_RGB_PANEL_DELAY)
 
     for pos, value in zip(inputs[:3], rgb):
         raise_if_stopped(stop_event)
         pyautogui.click(*pos)
-        time.sleep(0.025)
+        time.sleep(CUSTOM_RGB_INPUT_CLICK_DELAY)
         pyautogui.hotkey("ctrl", "a")
         pyautogui.write(str(int(np.clip(value, 0, 255))), interval=0)
-        time.sleep(0.035)
+        time.sleep(CUSTOM_RGB_INPUT_WRITE_DELAY)
 
     raise_if_stopped(stop_event)
 
@@ -3431,8 +3439,8 @@ class GarticQtDrawer(QMainWindow):
 
         mode_layout.addWidget(QLabel("Custom Colors"), 1, 2)
         self.custom_colors_spin = QSpinBox()
-        self.custom_colors_spin.setRange(8, 48)
-        self.custom_colors_spin.setSingleStep(4)
+        self.custom_colors_spin.setRange(8, MAX_CUSTOM_COLORS)
+        self.custom_colors_spin.setSingleStep(8)
         self.custom_colors_spin.setValue(DEFAULT_CUSTOM_COLORS)
         mode_layout.addWidget(self.custom_colors_spin, 1, 3)
 
@@ -4384,7 +4392,7 @@ class GarticQtDrawer(QMainWindow):
         mode = self.mode_value
         detail = int(self.detail_spin.value())
         line_scale = min(100, max(40, int(self.line_scale_spin.value())))
-        custom_colors = int(np.clip(int(self.custom_colors_spin.value()), 8, 48))
+        custom_colors = int(np.clip(int(self.custom_colors_spin.value()), 8, MAX_CUSTOM_COLORS))
         sbr_strokes = int(np.clip(int(self.sbr_strokes_spin.value()), 50, 1500))
         eye_detail = self.eye_detail_check.isChecked()
         spiral_fill = self.spiral_fill_check.isChecked()
@@ -4545,7 +4553,7 @@ class GarticQtDrawer(QMainWindow):
         line_gap_ms = max(0, int(self.line_gap_spin.value()))
         line_scale = min(100, max(40, int(self.line_scale_spin.value())))
         stroke_step = max(1, int(self.stroke_step_spin.value()))
-        custom_colors = int(np.clip(int(self.custom_colors_spin.value()), 8, 48))
+        custom_colors = int(np.clip(int(self.custom_colors_spin.value()), 8, MAX_CUSTOM_COLORS))
         sbr_strokes = int(np.clip(int(self.sbr_strokes_spin.value()), 50, 1500))
         auto_black = self.auto_black_check.isChecked()
         eye_detail = self.eye_detail_check.isChecked()
@@ -4618,7 +4626,7 @@ class GarticQtDrawer(QMainWindow):
                     if color_idx != current_color:
                         px, py = palette_positions[color_idx]
                         pyautogui.click(px, py)
-                        self.wait_or_stop(0.05)
+                        self.wait_or_stop(PALETTE_SELECT_DELAY)
                         current_color = color_idx
                     start_pt = screen_point_px(left, top, offset_x, offset_y, start)
                     end_pt = screen_point_px(left, top, offset_x, offset_y, end)
@@ -4812,11 +4820,11 @@ class GarticQtDrawer(QMainWindow):
 
                     if mode == MODE_CUSTOM_RGB:
                         set_custom_rgb_color(mapping_colors[color_idx], self.custom_rgb_controls, self.stop_event)
-                        self.wait_or_stop(0.05)
+                        self.wait_or_stop(PALETTE_SELECT_DELAY)
                     else:
                         px, py = palette_positions[color_idx]
                         pyautogui.click(px, py)
-                        self.wait_or_stop(0.05)
+                        self.wait_or_stop(PALETTE_SELECT_DELAY)
 
                     for path in spiral_paths:
                         raise_if_stopped(self.stop_event)
@@ -4879,11 +4887,11 @@ class GarticQtDrawer(QMainWindow):
                             continue
                         if mode == MODE_CUSTOM_RGB:
                             set_custom_rgb_color(mapping_colors[color_idx], self.custom_rgb_controls, self.stop_event)
-                            self.wait_or_stop(0.035)
+                            self.wait_or_stop(PALETTE_DETAIL_SELECT_DELAY)
                         else:
                             px, py = palette_positions[color_idx]
                             pyautogui.click(px, py)
-                            self.wait_or_stop(0.035)
+                            self.wait_or_stop(PALETTE_DETAIL_SELECT_DELAY)
 
                         for run in eye_runs:
                             raise_if_stopped(self.stop_event)
