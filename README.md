@@ -36,6 +36,16 @@ Gartic OpenCV Drawer 是一個用 OpenCV、PyAutoGUI 和 PySide6 製作的 Garti
 
 建議使用 Python 3.10 以上。
 
+下載原始碼 ZIP 並解壓縮後，可以直接雙擊：
+
+```text
+run_gartic_drawer.bat
+```
+
+啟動檔會自動建立 `.venv`、安裝 `requirements.txt`，再啟動程式。
+
+如果想手動執行，也可以使用：
+
 ```powershell
 git clone https://github.com/dragon4514/gartic_auto_drawer.git
 cd gartic_auto_drawer
@@ -168,6 +178,7 @@ python -m PyInstaller --noconfirm --clean GarticOpenCVDrawer.spec
 
 ```text
 gartic_auto_drawer.py          相容入口檔，保留原本啟動方式
+run_gartic_drawer.bat          Windows 雙擊啟動檔，會自動建立 venv 並安裝依賴
 GarticOpenCVDrawer.spec        PyInstaller 打包設定
 requirements.txt               Python 依賴套件
 gartic_drawer/
