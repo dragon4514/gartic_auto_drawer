@@ -91,7 +91,7 @@ DEFAULT_LINE_GAP_MS = 0
 DEFAULT_LINE_SCALE = 85
 DEFAULT_STROKE_STEP = 1
 DEFAULT_CUSTOM_COLORS = 48
-MAX_CUSTOM_COLORS = 384
+MAX_CUSTOM_COLORS = 512
 DEFAULT_SBR_STROKES = 300
 PREVIEW_MAX_SIZE = 620
 PALETTE_SELECT_DELAY = 0.07
@@ -446,6 +446,47 @@ def white_palette_indices(palette_colors, threshold=235):
     )
 
     return set(np.where(white_mask)[0].tolist())
+
+
+def canvas_white_pixel_mask(rgb, alpha, threshold=248, chroma_limit=22):
+    rgb = np.asarray(rgb, dtype=np.uint8)
+    alpha = np.asarray(alpha, dtype=np.uint8)
+    return (
+        (alpha >= 40)
+        & (np.min(rgb, axis=2) >= threshold)
+        & ((np.max(rgb, axis=2) - np.min(rgb, axis=2)) <= chroma_limit)
+    )
+
+
+def remap_palette_white_cells(idx, rgb, alpha, palette_colors, skip_mask, protected_mask):
+    """
+    Palette mode has only one true white swatch. Pale skin can be nearest to
+    that white swatch, but skipping it leaves face holes. Keep real canvas-white
+    pixels blank, and remap warm/off-white pixels to the nearest non-white color.
+    """
+    white_indices = white_palette_indices(palette_colors)
+    if not white_indices:
+        return idx
+
+    idx = np.asarray(idx, dtype=np.int16).copy()
+    white_idx_mask = np.isin(idx, list(white_indices))
+    if not np.any(white_idx_mask):
+        return idx
+
+    real_canvas_white = canvas_white_pixel_mask(rgb, alpha)
+    skip_mask = np.asarray(skip_mask, dtype=bool)
+    protected_mask = np.asarray(protected_mask, dtype=bool)
+    remap_mask = white_idx_mask & (~real_canvas_white) & (~skip_mask) & (~protected_mask)
+
+    non_white_indices = [i for i in range(len(palette_colors)) if i not in white_indices]
+    if remap_mask.any() and non_white_indices:
+        non_white_colors = [palette_colors[i] for i in non_white_indices]
+        local_idx = nearest_color_index_map(rgb, non_white_colors)
+        index_lookup = np.asarray(non_white_indices, dtype=np.int16)
+        idx[remap_mask] = index_lookup[local_idx[remap_mask]]
+
+    idx[white_idx_mask & real_canvas_white] = -1
+    return idx
 
 
 def nearest_color_index_map(rgb, palette_colors):
@@ -1532,7 +1573,7 @@ def pil_rgb_alpha_arrays(img, dtype=np.uint8):
     return arr[:, :, :3], arr[:, :, 3]
 
 
-def protected_white_shape_mask(rgb, alpha, white_threshold=235, chroma_limit=48, min_area=None, dilate_px=0):
+def protected_white_shape_mask(rgb, alpha, white_threshold=248, chroma_limit=22, min_area=None, dilate_px=0):
     """
     Preserve large white logo/text shapes as untouched canvas.
 
@@ -1554,7 +1595,7 @@ def protected_white_shape_mask(rgb, alpha, white_threshold=235, chroma_limit=48,
         return np.zeros(alpha.shape, dtype=bool)
 
     if min_area is None:
-        min_area = max(16, int(h * w * 0.00025))
+        min_area = max(24, int(h * w * 0.00050))
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(white.astype(np.uint8), 8)
     protected = np.zeros(alpha.shape, dtype=bool)
@@ -1592,11 +1633,14 @@ def image_to_palette_map(img_rgba, palette_colors, max_w, max_h, skip_white=True
         )
         skip = skip | background_white_mask(rgb.astype(np.uint8), alpha.astype(np.uint8))
 
-        # 被量化成 Gartic 白色色盤的地方仍不直接畫白，後面會用
-        # seal_thin_color_gaps() 把非保護區的小縫補回鄰近顏色。
-        white_indices = white_palette_indices(palette_colors)
-        if white_indices:
-            idx[np.isin(idx, list(white_indices))] = -1
+        idx = remap_palette_white_cells(
+            idx,
+            rgb.astype(np.uint8),
+            alpha.astype(np.uint8),
+            palette_colors,
+            skip,
+            protected_white,
+        )
 
     idx[skip] = -1
     idx[protected_white] = PROTECTED_WHITE
@@ -1606,10 +1650,12 @@ def image_to_palette_map(img_rgba, palette_colors, max_w, max_h, skip_white=True
 
 def detect_eye_detail_mask(rgb, alpha):
     """
-    Detect compact anime-eye details only.
-    This is intentionally conservative: it looks for small red/brown/dark
-    components in the upper-center character area, then adds tiny highlights
-    around those components.  It avoids changing broad background handling.
+    Detect compact anime face details: eyes, eyebrows, mouth, blush, nose and
+    tiny dark/red strokes.  Custom RGB with very high color counts can otherwise
+    merge these small regions back into skin/hair colors or paint them too early.
+
+    The detector is conservative: it only keeps compact components in the upper
+    character area, so large red clothing/hood regions are rejected.
     """
     rgb = np.asarray(rgb, dtype=np.uint8)
     alpha = np.asarray(alpha, dtype=np.uint8)
@@ -1625,33 +1671,58 @@ def detect_eye_detail_mask(rgb, alpha):
     val = hsv[:, :, 2]
 
     yy, xx = np.mgrid[0:h, 0:w]
-    roi = (
-        (alpha >= 40)
-        & (yy >= int(h * 0.14))
+    alpha_mask = alpha >= 40
+
+    # Most anime face details sit around the upper/center part of the image.
+    # Keep mouth handling narrower than eye handling so cheek/face shadows do
+    # not get promoted into hard final-pass strokes.
+    eye_roi = (
+        alpha_mask
+        & (yy >= int(h * 0.10))
+        & (yy <= int(h * 0.58))
+        & (xx >= int(w * 0.06))
+        & (xx <= int(w * 0.94))
+    )
+    mouth_roi = (
+        alpha_mask
+        & (yy >= int(h * 0.36))
         & (yy <= int(h * 0.66))
-        & (xx >= int(w * 0.10))
-        & (xx <= int(w * 0.90))
+        & (xx >= int(w * 0.24))
+        & (xx <= int(w * 0.76))
     )
 
-    # Red / brown / pink-ish eye pixels, plus very dark pupils/eyelashes.
     red_channel = rgb[:, :, 0].astype(np.int16)
     green_channel = rgb[:, :, 1].astype(np.int16)
     blue_channel = rgb[:, :, 2].astype(np.int16)
-    reddish = (
-        (red_channel > green_channel + 12)
-        & (red_channel > blue_channel + 6)
-        & (sat > 25)
-        & (val < 245)
-    )
-    hue_red_or_brown = ((hue <= 18) | (hue >= 165) | ((hue >= 6) & (hue <= 32))) & (sat > 28) & (val < 245)
-    dark_pupil = (gray < 115) & (alpha >= 40)
 
-    candidate = roi & (reddish | hue_red_or_brown | dark_pupil)
+    # Mouth / blush / warm eye colors.  The lower thresholds are intentional:
+    # after resizing and bilateral filtering, mouth pixels often become soft
+    # pink and would otherwise be treated as normal skin.
+    pink_or_red = (
+        (red_channel > green_channel + 10)
+        & (red_channel > blue_channel + 7)
+        & (sat > 18)
+        & (val > 85)
+        & (val < 252)
+    )
+    hue_warm = (
+        ((hue <= 24) | (hue >= 165) | ((hue >= 5) & (hue <= 34)))
+        & (sat > 24)
+        & (val > 60)
+        & (val < 252)
+    )
+
+    # Eyes, eyelashes, eyebrows, nostril/mouth outline.
+    dark_feature = (gray < 132) & alpha_mask
+    soft_line = (gray < 158) & (sat > 24) & alpha_mask
+
+    candidate = eye_roi & (pink_or_red | hue_warm | dark_feature | soft_line)
+    candidate |= mouth_roi & (pink_or_red | hue_warm | (gray < 135))
     candidate = cv2.morphologyEx(candidate.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
 
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(candidate, 8)
     keep = np.zeros((h, w), dtype=np.uint8)
-    max_area = max(6, int(h * w * 0.010))
+    max_area = max(8, int(h * w * 0.012))
     responsive = ResponsiveYield()
 
     for label in range(1, num_labels):
@@ -1663,9 +1734,15 @@ def detect_eye_detail_mask(rgb, alpha):
             continue
         if area > max_area:
             continue
-        if ww > w * 0.32 or hh > h * 0.18:
+        # Reject large pieces of hood/hair/clothes.  Mouth/eye/blush pieces are
+        # compact, even when the image is resized large.
+        if ww > w * 0.30 or hh > h * 0.20:
             continue
-        if cy < h * 0.16 or cy > h * 0.66:
+        if cy < h * 0.11 or cy > h * 0.72:
+            continue
+        # Lower face details should be tiny. This prevents cheek/chin shading on
+        # the lower-right face from being repainted as a hard facial feature.
+        if cy > h * 0.52 and (ww > w * 0.16 or hh > h * 0.08 or area > max(10, int(h * w * 0.0035))):
             continue
 
         keep[labels == label] = 1
@@ -1673,26 +1750,24 @@ def detect_eye_detail_mask(rgb, alpha):
     if not np.any(keep):
         return keep.astype(bool)
 
-    # Add tiny eye highlights / eyelid pixels close to detected eye blobs.
-    near_eye = cv2.dilate(keep, np.ones((5, 5), np.uint8), iterations=1) > 0
+    near_detail = cv2.dilate(keep, np.ones((5, 5), np.uint8), iterations=1) > 0
     small_highlight = (
-        roi
-        & near_eye
+        eye_roi
+        & near_detail
         & (np.min(rgb, axis=2) > 205)
-        & ((np.max(rgb, axis=2) - np.min(rgb, axis=2)) < 65)
+        & ((np.max(rgb, axis=2) - np.min(rgb, axis=2)) < 70)
     )
-    nearby_colored = roi & near_eye & (sat > 25) & (val < 250)
-    nearby_dark = roi & near_eye & (gray < 150)
+    nearby_colored = near_detail & ((eye_roi & (sat > 24)) | (mouth_roi & (pink_or_red | hue_warm))) & (val < 252)
+    nearby_dark = near_detail & (eye_roi | mouth_roi) & (gray < 150)
 
     detail = (keep > 0) | small_highlight | nearby_colored | nearby_dark
     detail = cv2.morphologyEx(detail.astype(np.uint8), cv2.MORPH_OPEN, np.ones((1, 1), np.uint8))
     return detail.astype(bool)
 
-
 def image_to_eye_detail_map(img_rgba, palette_colors, max_w, max_h):
     """
-    High-resolution final pass just for eyes.
-    Returns a color_map where non-eye pixels are -1.  Unlike global Skip White,
+    High-resolution final pass for eyes / mouth / face details.
+    Returns a color_map where non-detail pixels are -1.  Unlike global Skip White,
     white eye highlights are allowed so they can be restored after red/dark fills.
     """
     img = resize_keep_aspect(img_rgba, max_w, max_h)
@@ -1791,6 +1866,12 @@ def image_to_custom_rgb_map(img_rgba, max_w, max_h, color_count=24, skip_white=T
     dark_detail = (gray < 170) & (alpha >= 40)
     skip[dark_detail] = False
 
+    # 高色數時，小嘴巴 / 臉紅 / 眼睛只佔很少像素，隨機 k-means sample
+    # 很容易沒抽到，最後就會被附近膚色吃掉。先抓出臉部細節，後面
+    # 讓它們在取色樣本中有更高權重，並在清小碎塊後強制補回。
+    face_detail_mask = detect_eye_detail_mask(rgb_smooth, alpha) & (~skip)
+    face_detail_pixels = rgb[face_detail_mask]
+
     pixels = rgb_smooth[~skip]
 
     if len(pixels) == 0:
@@ -1806,6 +1887,28 @@ def image_to_custom_rgb_map(img_rgba, max_w, max_h, color_count=24, skip_white=T
         samples = pixels[sample_idx]
     else:
         samples = pixels
+
+    if len(face_detail_pixels) > 0:
+        detail_limit = 5000 if color_count >= 128 else 2500
+        if len(face_detail_pixels) > detail_limit:
+            detail_idx = rng.choice(len(face_detail_pixels), detail_limit, replace=False)
+            detail_samples = face_detail_pixels[detail_idx]
+        else:
+            detail_samples = face_detail_pixels
+
+        if color_count >= 256:
+            detail_weight = 6
+        elif color_count >= 128:
+            detail_weight = 4
+        elif color_count >= 64:
+            detail_weight = 3
+        else:
+            detail_weight = 2
+
+        samples = np.concatenate([
+            samples,
+            np.repeat(detail_samples, detail_weight, axis=0)
+        ], axis=0)
 
     samples = np.float32(samples)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 35, 0.6)
@@ -1844,6 +1947,13 @@ def image_to_custom_rgb_map(img_rgba, max_w, max_h, color_count=24, skip_white=T
         min_area = max(4, int(max_w * max_h * 0.00018))
 
     idx = remove_small_color_regions(idx, k, min_area)
+
+    if np.any(face_detail_mask):
+        # 清小區塊可能會把嘴巴、腮紅、眼神光這種很小的顏色刪掉；
+        # 這裡用原始 RGB 再量化一次，把臉部細節補回最後的 map。
+        face_detail_idx = nearest_color_index_map(rgb, centers_i)
+        idx[face_detail_mask] = face_detail_idx[face_detail_mask]
+
     idx[protected_white] = PROTECTED_WHITE
 
     colors = [tuple(int(v) for v in color) for color in centers_i]
@@ -1930,26 +2040,13 @@ def image_to_cartoon_color_map(img_rgba, palette_colors, max_w, max_h, skip_whit
     protected_white = np.zeros(alpha.shape, dtype=bool)
 
     if skip_white:
-        # 原圖白色 / 接近白色背景直接跳過。
-        near_white = np.all(rgb > 246, axis=2)
-        almost_white = (
-            np.min(rgb, axis=2) > 225
-        ) & (
-            np.max(rgb, axis=2) - np.min(rgb, axis=2) < 40
-        )
         protected_white = protected_white_shape_mask(
             rgb,
             alpha,
-            white_threshold=225,
-            chroma_limit=55,
             dilate_px=white_protect_radius
         )
-        skip = skip | near_white | almost_white
-
-        # 被轉換成 Gartic 白色色盤的，也直接跳過。
-        white_indices = white_palette_indices(palette_colors)
-        if white_indices:
-            idx[np.isin(idx, list(white_indices))] = -1
+        skip = skip | background_white_mask(rgb, alpha)
+        idx = remap_palette_white_cells(idx, rgb, alpha, palette_colors, skip, protected_white)
 
     idx[skip] = -1
 
@@ -5494,7 +5591,7 @@ class GarticQtDrawer(QMainWindow):
             self.auto_black_check.setToolTip("只在線稿模式有用，會先自動選最深色。")
         if hasattr(self, "eye_detail_check"):
             self._set_widget_group_enabled(mode in color_modes, self.eye_detail_check)
-            self.eye_detail_check.setToolTip("只在 Palette / Custom RGB 上色模式補畫眼睛細節。")
+            self.eye_detail_check.setToolTip("只在 Palette / Custom RGB 上色模式補畫眼睛、嘴巴、臉部小細節。")
         if hasattr(self, "spiral_fill_check"):
             self._set_widget_group_enabled(mode in color_modes, self.spiral_fill_check)
             self.spiral_fill_check.setToolTip("只在 Palette / Custom RGB 上色模式使用。")
@@ -6212,7 +6309,7 @@ class GarticQtDrawer(QMainWindow):
                 offset_px_x = target_x + (target_w - draw_px_w) / 2
                 offset_px_y = target_y + (target_h - draw_px_h) / 2
 
-                if skip_white:
+                if skip_white and mode == MODE_PALETTE:
                     for wi in white_palette_indices(mapping_colors):
                         color_map[color_map == wi] = -1
 
@@ -6572,7 +6669,7 @@ class GarticQtDrawer(QMainWindow):
                 offset_px_x = target_x + (target_w - draw_px_w) / 2
                 offset_px_y = target_y + (target_h - draw_px_h) / 2
 
-                if skip_white:
+                if skip_white and mode == MODE_PALETTE:
                     for wi in white_palette_indices(mapping_colors):
                         color_map[color_map == wi] = -1
 
@@ -6673,7 +6770,7 @@ class GarticQtDrawer(QMainWindow):
                             (target_y + (target_h - eye_draw_px_h) / 2) if using_placement else (canvas_h - eye_draw_px_h) / 2,
                         )
                         eye_run_count = sum(len(runs) for runs in eye_detail_runs_by_color)
-                        self.log(f"眼睛細節強化已準備：{eye_run_count} 小段，最後補畫避免被底色吃掉")
+                        self.log(f"臉部細節強化已準備：{eye_run_count} 小段，最後補畫避免被底色吃掉")
 
                 color_order = color_draw_order(mapping_colors)
                 white_indices = white_palette_indices(mapping_colors) if skip_white and mode != MODE_CUSTOM_RGB else set()
@@ -6753,7 +6850,7 @@ class GarticQtDrawer(QMainWindow):
                             self.wait_or_stop(max(delay, 0.001))
 
                 if eye_detail_runs_by_color is not None and eye_detail_offsets is not None:
-                    self.log("開始補畫眼睛細節...")
+                    self.log("開始補畫臉部細節...")
                     select_gartic_brush(eye_detail_brush_key, self.brush_positions, self.stop_event, focus_point=hotkey_focus_point)
                     eye_offset_x, eye_offset_y = eye_detail_offsets
                     eye_order = eye_order_for_progress
