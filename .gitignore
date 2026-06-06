@@ -11,6 +11,11 @@ env/
 
 *.log
 *.tmp
+*.zip
+
+# Build artifacts
+build/
+dist/
 
 # Local canvas/profile calibration
 profiles/

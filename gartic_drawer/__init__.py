@@ -1,0 +1,1 @@
+"""Gartic OpenCV Drawer package."""

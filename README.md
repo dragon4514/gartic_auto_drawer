@@ -33,6 +33,21 @@ pip install -r requirements.txt
 python gartic_auto_drawer.py
 ```
 
+## 重要提醒
+
+建議在瀏覽器安裝廣告阻擋套件後再使用。Gartic Phone 頁面上的廣告可能造成瀏覽器卡頓，進而讓滑鼠拖曳、快捷鍵或換色事件被漏掉，導致畫出來和預覽不同。
+
+## 打包 EXE
+
+專案已提供 PyInstaller 設定檔，可用下面指令重新產生單檔 Windows exe：
+
+```powershell
+python -m pip install pyinstaller
+python -m PyInstaller --noconfirm --clean GarticOpenCVDrawer.spec
+```
+
+輸出檔會在 `dist/GarticOpenCVDrawer.exe`。`dist/` 和 `build/` 已加入 `.gitignore`，建議把 exe 放到 GitHub Release assets，不直接提交到 repo。
+
 ## 使用方式
 
 1. 開啟 Gartic Phone 繪圖頁面，確認畫布、色盤、筆刷列都看得到。
@@ -99,9 +114,16 @@ python gartic_auto_drawer.py
 - 降低 `Image Scale`。
 - 使用較大的 Brush Key，但細節會變少。
 
-## 專案檔案
+## 專案結構
 
-- `gartic_auto_drawer.py`：主程式
+- `gartic_auto_drawer.py`：相容入口檔，保留 `python gartic_auto_drawer.py` 的啟動方式
+- `gartic_drawer/app.py`：Qt 主視窗、按鈕事件、預覽與繪製流程
+- `gartic_drawer/config.py`：模式名稱、預設值、Gartic 色盤、筆刷與設定檔路徑
+- `gartic_drawer/detection.py`：畫布、色盤、筆刷按鈕與 RGB 面板偵測
+- `gartic_drawer/image_processing.py`：圖片縮放、量化、線稿、色塊、SBR 與預覽渲染
+- `gartic_drawer/automation.py`：滑鼠/鍵盤操作、路徑排序、色塊填充路徑
+- `gartic_drawer/ui/`：可重用 Qt 元件與校正 Overlay
+- `GarticOpenCVDrawer.spec`：PyInstaller 打包設定
 - `requirements.txt`：Python 依賴套件
 - `profiles/gartic_profiles.json`：本機自動產生的畫布設定檔，不會提交到 Git
 - `.gitignore`：忽略快取、虛擬環境與本機測試輸出
