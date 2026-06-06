@@ -177,20 +177,10 @@ python -m PyInstaller --noconfirm --clean GarticOpenCVDrawer.spec
 ## 專案結構
 
 ```text
-gartic_auto_drawer.py          相容入口檔，保留原本啟動方式
+gartic_auto_drawer.py          完整單檔主程式，內部用區塊整理設定、偵測、影像處理、UI 與自動繪製流程
 run_gartic_drawer.bat          Windows 雙擊啟動檔，會自動建立 venv 並安裝依賴
 GarticOpenCVDrawer.spec        PyInstaller 打包設定
 requirements.txt               Python 依賴套件
-gartic_drawer/
-  app.py                       Qt 主視窗、事件、預覽與繪製流程
-  automation.py                滑鼠/鍵盤操作、路徑排序、填色路徑
-  common.py                    共用例外與 UI yield helper
-  config.py                    模式名稱、預設值、色盤、筆刷與設定檔路徑
-  detection.py                 畫布、色盤、筆刷與 RGB 面板偵測
-  image_processing.py          圖片縮放、量化、線稿、色塊、預覽與 SBR
-  ui/
-    overlays.py                偵測校正與圖片位置 Overlay
-    widgets.py                 可重用 Qt 元件
 ```
 
 ## 開發檢查
@@ -198,7 +188,7 @@ gartic_drawer/
 修改程式後可先執行：
 
 ```powershell
-python -m compileall -q gartic_auto_drawer.py gartic_drawer
+python -m py_compile gartic_auto_drawer.py
 python -c "import gartic_auto_drawer; print('import ok')"
 ```
 
