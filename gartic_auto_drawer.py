@@ -2797,6 +2797,323 @@ def color_map_to_gartic_preview(
     return Image.fromarray(preview, "RGB")
 
 
+def format_estimated_seconds(seconds):
+    seconds = max(0.0, float(seconds))
+
+    if seconds < 1:
+        return "<1 秒"
+
+    total = int(round(seconds))
+
+    if total < 60:
+        return f"約 {total} 秒"
+
+    minutes, secs = divmod(total, 60)
+
+    if minutes < 60:
+        if secs:
+            return f"約 {minutes} 分 {secs:02d} 秒"
+        return f"約 {minutes} 分"
+
+    hours, minutes = divmod(minutes, 60)
+    if minutes:
+        return f"約 {hours} 小時 {minutes:02d} 分"
+    return f"約 {hours} 小時"
+
+
+def preview_stats_text(estimated_seconds, stroke_count, color_changes):
+    return (
+        f"估時: {format_estimated_seconds(estimated_seconds)} | "
+        f"筆畫: {int(stroke_count)} | 換色: {int(color_changes)}"
+    )
+
+
+def estimate_brush_select_seconds(brush_key, brush_positions=None):
+    brush_key = clamp_brush_key(brush_key)
+    has_visible_button = bool(brush_positions and len(brush_positions) >= max(1, brush_key))
+
+    if brush_key == 0:
+        return HOTKEY_FOCUS_DELAY + 0.30
+    if has_visible_button:
+        return 0.20
+    return HOTKEY_FOCUS_DELAY + 0.30
+
+
+def estimate_custom_rgb_select_seconds(rgb, panel_delay):
+    seconds = CUSTOM_RGB_SWATCH_CLICK_DELAY + max(0.0, float(panel_delay))
+
+    for value in rgb:
+        text = str(int(np.clip(value, 0, 255)))
+        seconds += CUSTOM_RGB_INPUT_CLICK_DELAY
+        seconds += len(text) * CUSTOM_RGB_TYPE_INTERVAL
+        seconds += CUSTOM_RGB_INPUT_WRITE_DELAY
+
+    return seconds
+
+
+def count_color_transitions(color_indices):
+    current_color = None
+    changes = 0
+
+    for color_idx in color_indices:
+        color_idx = int(color_idx)
+        if color_idx != current_color:
+            changes += 1
+            current_color = color_idx
+
+    return changes
+
+
+def estimate_line_preview_seconds(strokes, line_move_ms, line_gap_ms, color_changes=0, brush_seconds=0.0):
+    move_seconds = max(0.0, float(line_move_ms) / 1000.0)
+    gap_seconds = max(0.0, float(line_gap_ms) / 1000.0)
+    seconds = float(brush_seconds) + max(0, int(color_changes)) * 0.10
+
+    for stroke in strokes:
+        if len(stroke) < 2:
+            seconds += 0.005
+            continue
+        seconds += 0.06
+        seconds += max(0, len(stroke) - 1) * move_seconds
+        seconds += gap_seconds
+
+    return seconds
+
+
+def estimate_sbr_preview_seconds(strokes, cps, line_move_ms, color_changes, brush_seconds=0.0):
+    move_seconds = max(0.001, float(line_move_ms) / 1000.0)
+    batch_wait = max(1.0 / max(1.0, float(cps)), 0.001)
+    stroke_count = len(strokes)
+    seconds = float(brush_seconds)
+    seconds += max(0, int(color_changes)) * PALETTE_SELECT_DELAY
+    seconds += stroke_count * (0.06 + move_seconds)
+    seconds += (stroke_count // 10) * batch_wait
+    return seconds
+
+
+def estimate_color_run_seconds(run, cell_step_px, brush_px, requested_drag):
+    y, start, end, reverse = normalize_run(run)
+    del y, reverse
+    distance = max(0, end - start - 1) * max(1, int(cell_step_px))
+
+    if distance <= 1:
+        return 0.003
+
+    brush_px = max(1, int(brush_px))
+    segment_px = 120 if brush_px <= 3 else 170 if brush_px <= 6 else 230
+    overlap_px = max(2, min(10, int(max(brush_px, 2) * 0.55)))
+
+    if distance <= segment_px:
+        return color_drag_duration(distance, brush_px, requested_drag)
+
+    seconds = 0.0
+    current = 0
+
+    while True:
+        remaining = distance - current
+        target = distance if remaining <= segment_px else current + segment_px
+        seconds += color_drag_duration(target - current, brush_px, requested_drag)
+
+        if target >= distance:
+            break
+
+        current = max(0, target - overlap_px)
+
+    return seconds
+
+
+def estimate_spiral_path_seconds(path, cell_step_px):
+    if len(path) < 2:
+        return 0.003 if path else 0.0
+
+    cell_step_px = max(1, int(cell_step_px))
+    seconds = 0.010
+    last_x, last_y = path[0]
+
+    for x, y in path[1:]:
+        dx = (x - last_x) * cell_step_px
+        dy = (y - last_y) * cell_step_px
+        distance = (dx * dx + dy * dy) ** 0.5
+        seconds += max(0.0008, min(0.0045, distance / 18000.0))
+        last_x, last_y = x, y
+
+    return seconds
+
+
+def color_plan_preview_metrics(
+    mode,
+    mapping_colors,
+    color_order,
+    runs_by_color,
+    spiral_paths_by_color,
+    white_indices,
+    eye_order,
+    eye_runs_by_color,
+    cps,
+    line_move_ms,
+    brush_px,
+    cell_step_px,
+    rgb_panel_delay_ms,
+    eye_brush_px=1,
+    eye_cell_step_px=1,
+    brush_seconds=0.0,
+):
+    requested_drag = max(0.001, float(line_move_ms) / 1000.0)
+    batch_wait = max(1.0 / max(1.0, float(cps)), 0.001)
+    rgb_panel_delay = max(0.0, min(0.5, float(rgb_panel_delay_ms) / 1000.0))
+    total_ops = 0
+    color_changes = 0
+    seconds = float(brush_seconds)
+
+    def selection_seconds(color_idx, detail=False):
+        select_delay = PALETTE_DETAIL_SELECT_DELAY if detail else PALETTE_SELECT_DELAY
+        if mode == MODE_CUSTOM_RGB:
+            return estimate_custom_rgb_select_seconds(mapping_colors[color_idx], rgb_panel_delay) + select_delay
+        return select_delay
+
+    for color_idx in color_order:
+        if color_idx in white_indices:
+            continue
+
+        runs = runs_by_color[color_idx] if color_idx < len(runs_by_color) else []
+        spiral_paths = spiral_paths_by_color[color_idx] if color_idx < len(spiral_paths_by_color) else []
+        if not runs and not spiral_paths:
+            continue
+
+        color_changes += 1
+        seconds += selection_seconds(color_idx, detail=False)
+
+        for path in spiral_paths:
+            seconds += estimate_spiral_path_seconds(path, cell_step_px)
+            total_ops += 1
+            if total_ops % 8 == 0:
+                seconds += batch_wait
+
+        for run in runs:
+            seconds += estimate_color_run_seconds(run, cell_step_px, brush_px, requested_drag)
+            total_ops += 1
+            if total_ops % 10 == 0:
+                seconds += batch_wait
+
+    if eye_runs_by_color is not None and eye_order:
+        seconds += estimate_brush_select_seconds(0 if brush_px <= 1 else 1)
+
+        for color_idx in eye_order:
+            eye_runs = eye_runs_by_color[color_idx] if color_idx < len(eye_runs_by_color) else []
+            if not eye_runs:
+                continue
+
+            color_changes += 1
+            seconds += selection_seconds(color_idx, detail=True)
+
+            for run in eye_runs:
+                seconds += estimate_color_run_seconds(
+                    run,
+                    eye_cell_step_px,
+                    eye_brush_px,
+                    max(0.001, min(0.008, requested_drag)),
+                )
+                total_ops += 1
+                if total_ops % 25 == 0:
+                    seconds += batch_wait
+
+    return total_ops, color_changes, seconds
+
+
+def planned_color_runs_to_canvas_preview(
+    canvas_w,
+    canvas_h,
+    mapping_colors,
+    color_order,
+    runs_by_color,
+    spiral_paths_by_color,
+    offset_x,
+    offset_y,
+    brush_px,
+    cell_step_px,
+    white_indices=None,
+    eye_order=None,
+    eye_runs_by_color=None,
+    eye_offset_x=0,
+    eye_offset_y=0,
+    eye_brush_px=1,
+    eye_cell_step_px=1,
+):
+    canvas_w = max(1, int(canvas_w))
+    canvas_h = max(1, int(canvas_h))
+    brush_px = max(1, int(brush_px))
+    cell_step_px = max(1, int(cell_step_px))
+    white_indices = set(white_indices or [])
+    preview = np.full((canvas_h, canvas_w, 3), 255, dtype=np.uint8)
+
+    def color_tuple(color_idx):
+        return tuple(int(v) for v in mapping_colors[color_idx])
+
+    def paint_run(run, color, run_offset_x, run_offset_y, run_brush_px, run_cell_step_px):
+        y, start, end, reverse = normalize_run(run)
+        if end <= start:
+            return
+
+        draw_start = end - 1 if reverse else start
+        draw_end = start if reverse else end - 1
+        sx = int(round(run_offset_x + draw_start * run_cell_step_px + run_brush_px / 2))
+        ex = int(round(run_offset_x + draw_end * run_cell_step_px + run_brush_px / 2))
+        sy = int(round(run_offset_y + y * run_cell_step_px + run_brush_px / 2))
+
+        if abs(ex - sx) <= 1:
+            cv2.circle(preview, (sx, sy), max(1, run_brush_px // 2), color, thickness=-1, lineType=cv2.LINE_AA)
+        else:
+            cv2.line(preview, (sx, sy), (ex, sy), color, thickness=run_brush_px, lineType=cv2.LINE_AA)
+
+    def paint_spiral(path, color):
+        if not path:
+            return
+
+        points = np.asarray(
+            [
+                (
+                    int(round(offset_x + px * cell_step_px + brush_px / 2)),
+                    int(round(offset_y + py * cell_step_px + brush_px / 2)),
+                )
+                for px, py in path
+            ],
+            dtype=np.int32,
+        )
+
+        if len(points) == 1:
+            cv2.circle(preview, tuple(points[0]), max(1, brush_px // 2), color, thickness=-1, lineType=cv2.LINE_AA)
+        else:
+            cv2.polylines(preview, [points.reshape((-1, 1, 2))], False, color, thickness=brush_px, lineType=cv2.LINE_AA)
+
+    for color_idx in color_order:
+        if color_idx in white_indices:
+            continue
+
+        color = color_tuple(color_idx)
+
+        if color_idx < len(spiral_paths_by_color):
+            for path in spiral_paths_by_color[color_idx]:
+                paint_spiral(path, color)
+
+        if color_idx < len(runs_by_color):
+            for run in runs_by_color[color_idx]:
+                paint_run(run, color, offset_x, offset_y, brush_px, cell_step_px)
+
+    if eye_runs_by_color is not None and eye_order:
+        eye_brush_px = max(1, int(eye_brush_px))
+        eye_cell_step_px = max(1, int(eye_cell_step_px))
+
+        for color_idx in eye_order:
+            if color_idx >= len(eye_runs_by_color):
+                continue
+
+            color = color_tuple(color_idx)
+            for run in eye_runs_by_color[color_idx]:
+                paint_run(run, color, eye_offset_x, eye_offset_y, eye_brush_px, eye_cell_step_px)
+
+    return Image.fromarray(preview, "RGB")
+
+
 def compose_canvas_preview(content, canvas_w, canvas_h):
     canvas_w = max(1, int(canvas_w))
     canvas_h = max(1, int(canvas_h))
@@ -5758,16 +6075,38 @@ class GarticQtDrawer(QMainWindow):
             self.signals.detecting_changed.emit(False)
 
     def _collect_preview_params(self):
+        cps = max(1.0, float(self.cps_spin.value()))
         brush_key = clamp_brush_key(self.brush_spin.value())
         skip_white = self.skip_white_check.isChecked()
         mode = self.mode_value
         detail = int(self.detail_spin.value())
+        line_move_ms = max(1, int(self.line_move_spin.value()))
+        line_gap_ms = max(0, int(self.line_gap_spin.value()))
         line_scale = min(100, max(40, int(self.line_scale_spin.value())))
+        stroke_step = max(1, int(self.stroke_step_spin.value()))
         custom_colors = int(np.clip(int(self.custom_colors_spin.value()), 8, MAX_CUSTOM_COLORS))
         sbr_strokes = int(np.clip(int(self.sbr_strokes_spin.value()), 50, 1500))
+        rgb_panel_delay_ms = int(np.clip(int(self.rgb_panel_delay_spin.value()), 0, 500))
+        auto_black = self.auto_black_check.isChecked()
         eye_detail = self.eye_detail_check.isChecked()
         spiral_fill = self.spiral_fill_check.isChecked()
-        return brush_key, skip_white, mode, detail, line_scale, custom_colors, sbr_strokes, eye_detail, spiral_fill
+        return (
+            cps,
+            brush_key,
+            skip_white,
+            mode,
+            detail,
+            line_move_ms,
+            line_gap_ms,
+            line_scale,
+            stroke_step,
+            custom_colors,
+            sbr_strokes,
+            rgb_panel_delay_ms,
+            auto_black,
+            eye_detail,
+            spiral_fill,
+        )
 
     def preview_thread(self):
         if self.is_previewing:
@@ -5782,7 +6121,7 @@ class GarticQtDrawer(QMainWindow):
         self.set_previewing(True)
         threading.Thread(target=self.build_preview, args=args, daemon=True).start()
 
-    def build_preview(self, brush_key, skip_white, mode, detail, line_scale, custom_colors, sbr_strokes, eye_detail, spiral_fill):
+    def build_preview(self, cps, brush_key, skip_white, mode, detail, line_move_ms, line_gap_ms, line_scale, stroke_step, custom_colors, sbr_strokes, rgb_panel_delay_ms, auto_black, eye_detail, spiral_fill):
         try:
             brush_px = gartic_brush_pixels(brush_key)
             x1, y1, x2, y2 = self.canvas
@@ -5804,18 +6143,41 @@ class GarticQtDrawer(QMainWindow):
                 offset_y = target_y + (target_h - content.size[1]) / 2
                 preview = compose_canvas_preview_at(content, canvas_w, canvas_h, offset_x, offset_y)
                 pos_text = "定位" if using_placement else "置中"
-                info = f"SBR 筆觸預覽 | {pos_text} | 畫布: {canvas_w}x{canvas_h} | 目標區: {int(target_w)}x{int(target_h)} | 圖像: {img_size[0]}x{img_size[1]} | 筆觸: {len(strokes)} | 筆刷鍵: {brush_key}"
+                color_changes = count_color_transitions([stroke[0] for stroke in strokes])
+                estimated = estimate_sbr_preview_seconds(
+                    strokes,
+                    cps,
+                    line_move_ms,
+                    color_changes,
+                    brush_seconds=estimate_brush_select_seconds(brush_key, self.brush_positions),
+                )
+                stats = preview_stats_text(estimated, len(strokes), color_changes)
+                info = f"SBR 筆觸預覽 | {stats} | {pos_text} | 畫布: {canvas_w}x{canvas_h} | 目標區: {int(target_w)}x{int(target_h)} | 圖像: {img_size[0]}x{img_size[1]} | 筆刷鍵: {brush_key}"
             elif mode in (MODE_SMART_LINE, MODE_LINE, MODE_CLEAN_LINE, MODE_DARK_OUTLINE):
                 self.log("運算中：正在分析線稿，UI 已改成非阻塞模式。")
                 line_max_w = max(1, int(target_w))
                 line_max_h = max(1, int(target_h))
                 strokes, img_size = image_to_smart_line_strokes(self.image, line_max_w, line_max_h, detail=detail)
-                content = line_strokes_to_image(strokes, img_size, line_width=brush_px)
+                before_air = stroke_air_distance(strokes)
+                strokes = optimize_stroke_order(strokes)
+                after_air = stroke_air_distance(strokes)
+                preview_strokes = [decimate_stroke(stroke, stroke_step) for stroke in strokes]
+                content = line_strokes_to_image(preview_strokes, img_size, line_width=brush_px)
                 offset_x = target_x + (target_w - content.size[0]) / 2
                 offset_y = target_y + (target_h - content.size[1]) / 2
                 preview = compose_canvas_preview_at(content, canvas_w, canvas_h, offset_x, offset_y)
                 pos_text = "定位" if using_placement else "置中"
-                info = f"整合線稿預覽 | {pos_text} | 畫布: {canvas_w}x{canvas_h} | 目標區: {int(target_w)}x{int(target_h)} | 圖像: {img_size[0]}x{img_size[1]} | 筆刷鍵: {brush_key} | 總筆畫: {len(strokes)}"
+                color_changes = 1 if auto_black and self.palette else 0
+                estimated = estimate_line_preview_seconds(
+                    preview_strokes,
+                    line_move_ms,
+                    line_gap_ms,
+                    color_changes=color_changes,
+                    brush_seconds=estimate_brush_select_seconds(brush_key, self.brush_positions),
+                )
+                stats = preview_stats_text(estimated, len(preview_strokes), color_changes)
+                saved = 0.0 if before_air <= 0 else max(0.0, (before_air - after_air) / before_air * 100.0)
+                info = f"整合線稿預覽 | {stats} | {pos_text} | 畫布: {canvas_w}x{canvas_h} | 目標區: {int(target_w)}x{int(target_h)} | 圖像: {img_size[0]}x{img_size[1]} | 筆刷鍵: {brush_key} | Step: {stroke_step} | 空移動減少: {saved:.1f}%"
             elif mode in (MODE_PALETTE, MODE_CUSTOM_RGB):
                 self.log("運算中：正在量化色彩與排序路徑，UI 已改成非阻塞模式。")
                 color_max_w = max(1, int(target_w))
@@ -5844,16 +6206,15 @@ class GarticQtDrawer(QMainWindow):
                     )
                     label = "全彩色盤預覽"
 
-                if eye_detail and mode in (MODE_PALETTE, MODE_CUSTOM_RGB):
-                    eye_map, _eye_size = image_to_eye_detail_map(
-                        self.image, mapping_colors, color_map.shape[1], color_map.shape[0]
-                    )
-                    eye_map = resize_label_map_to_shape(eye_map, color_map.shape)
+                draw_w, draw_h = img_size
+                draw_px_w = (draw_w - 1) * cell_step_px + brush_px
+                draw_px_h = (draw_h - 1) * cell_step_px + brush_px
+                offset_px_x = target_x + (target_w - draw_px_w) / 2
+                offset_px_y = target_y + (target_h - draw_px_h) / 2
+
+                if skip_white:
                     for wi in white_palette_indices(mapping_colors):
-                        eye_map[eye_map == wi] = -1
-                    eye_mask = eye_map >= 0
-                    if np.any(eye_mask):
-                        color_map[eye_mask] = eye_map[eye_mask]
+                        color_map[color_map == wi] = -1
 
                 hole_area = color_hole_area(mode, brush_px)
                 if hole_area > 0:
@@ -5865,13 +6226,16 @@ class GarticQtDrawer(QMainWindow):
                     max_area=max(18, int(max(color_map.shape) * 1.5))
                 )
 
-                preview_color_map = color_map
-                spiral_paths_by_color = None
+                bridge_gap = color_run_bridge_gap(mode, brush_px)
+                exact_runs_by_color, _exact_pixel_counts = build_color_runs(color_map, len(mapping_colors))
+                spiral_paths_by_color = [[] for _ in range(len(mapping_colors))]
+                fill_source_map = color_map
+                spiral_stats = None
                 spiral_count = 0
                 spiral_enabled = bool(spiral_fill and mode in (MODE_PALETTE, MODE_CUSTOM_RGB))
 
                 if spiral_enabled:
-                    spiral_paths_by_color, preview_color_map, _spiral_stats = build_spiral_fill_paths(
+                    spiral_paths_by_color, fill_source_map, spiral_stats = build_spiral_fill_paths(
                         color_map,
                         len(mapping_colors),
                         brush_px=brush_px,
@@ -5881,20 +6245,90 @@ class GarticQtDrawer(QMainWindow):
                     spiral_paths_by_color = [optimize_spiral_path_order(paths) for paths in spiral_paths_by_color]
                     spiral_count = sum(len(paths) for paths in spiral_paths_by_color)
 
-                content = color_map_to_gartic_preview(
-                    preview_color_map, mapping_colors, brush_px,
-                    reverse_order=(mode == MODE_CUSTOM_RGB),
-                    bridge_gap=color_run_bridge_gap(mode, brush_px),
-                    use_contour=False,
-                    cell_step_px=cell_step_px,
-                    spiral_paths_by_color=spiral_paths_by_color
+                raw_runs_by_color, _pixel_counts = build_color_runs(
+                    fill_source_map,
+                    len(mapping_colors),
+                    bridge_gap=bridge_gap
                 )
-                offset_x = target_x + (target_w - content.size[0]) / 2
-                offset_y = target_y + (target_h - content.size[1]) / 2
-                preview = compose_canvas_preview_at(content, canvas_w, canvas_h, offset_x, offset_y)
+                runs_by_color = [optimize_run_order(runs) for runs in raw_runs_by_color]
+
+                eye_detail_runs_by_color = None
+                eye_detail_offsets = None
+                eye_detail_brush_key = 0 if brush_key == 0 else 1
+                eye_detail_cell_step_px = 1
+                eye_detail_brush_px = gartic_brush_pixels(eye_detail_brush_key)
+
+                if eye_detail and mode in (MODE_PALETTE, MODE_CUSTOM_RGB):
+                    eye_scale = min(100, max(line_scale, 95))
+                    eye_max_w = max(1, int(target_w if using_placement else canvas_w * eye_scale / 100))
+                    eye_max_h = max(1, int(target_h if using_placement else canvas_h * eye_scale / 100))
+                    eye_map, eye_img_size = image_to_eye_detail_map(
+                        self.image, mapping_colors, eye_max_w, eye_max_h
+                    )
+                    for wi in white_palette_indices(mapping_colors):
+                        eye_map[eye_map == wi] = -1
+                    if np.any(eye_map >= 0):
+                        raw_eye_runs, _eye_counts = build_color_runs(eye_map, len(mapping_colors), bridge_gap=0)
+                        eye_detail_runs_by_color = [optimize_run_order(runs) for runs in raw_eye_runs]
+                        eye_w, eye_h = eye_img_size
+                        eye_draw_px_w = (eye_w - 1) * eye_detail_cell_step_px + eye_detail_brush_px
+                        eye_draw_px_h = (eye_h - 1) * eye_detail_cell_step_px + eye_detail_brush_px
+                        eye_detail_offsets = (
+                            (target_x + (target_w - eye_draw_px_w) / 2) if using_placement else (canvas_w - eye_draw_px_w) / 2,
+                            (target_y + (target_h - eye_draw_px_h) / 2) if using_placement else (canvas_h - eye_draw_px_h) / 2,
+                        )
+
+                color_order = color_draw_order(mapping_colors)
+                white_indices = white_palette_indices(mapping_colors) if skip_white and mode != MODE_CUSTOM_RGB else set()
+                eye_order = []
+                if eye_detail_runs_by_color is not None:
+                    eye_white_indices = set(white_palette_indices(mapping_colors))
+                    eye_order = [idx for idx in color_draw_order(mapping_colors) if idx not in eye_white_indices]
+
+                preview = planned_color_runs_to_canvas_preview(
+                    canvas_w,
+                    canvas_h,
+                    mapping_colors,
+                    color_order,
+                    runs_by_color,
+                    spiral_paths_by_color,
+                    offset_px_x,
+                    offset_px_y,
+                    brush_px,
+                    cell_step_px,
+                    white_indices=white_indices,
+                    eye_order=eye_order,
+                    eye_runs_by_color=eye_detail_runs_by_color,
+                    eye_offset_x=eye_detail_offsets[0] if eye_detail_offsets else 0,
+                    eye_offset_y=eye_detail_offsets[1] if eye_detail_offsets else 0,
+                    eye_brush_px=eye_detail_brush_px,
+                    eye_cell_step_px=eye_detail_cell_step_px,
+                )
+                total_ops, color_changes, estimated = color_plan_preview_metrics(
+                    mode,
+                    mapping_colors,
+                    color_order,
+                    runs_by_color,
+                    spiral_paths_by_color,
+                    white_indices,
+                    eye_order,
+                    eye_detail_runs_by_color,
+                    cps,
+                    line_move_ms,
+                    brush_px,
+                    cell_step_px,
+                    rgb_panel_delay_ms,
+                    eye_brush_px=eye_detail_brush_px,
+                    eye_cell_step_px=eye_detail_cell_step_px,
+                    brush_seconds=estimate_brush_select_seconds(brush_key, self.brush_positions),
+                )
+                exact_run_count = sum(len(runs) for runs in exact_runs_by_color)
+                planned_run_count = sum(len(runs) for runs in runs_by_color)
+                reduced = 0.0 if exact_run_count <= 0 else max(0.0, (exact_run_count - planned_run_count) / exact_run_count * 100.0)
                 spiral_state = f"ON/{spiral_count}" if spiral_enabled else "OFF"
                 pos_text = "定位" if using_placement else "置中"
-                info = f"{label} | {pos_text} | 畫布: {canvas_w}x{canvas_h} | 目標區: {int(target_w)}x{int(target_h)} | 圖像: {content.size[0]}x{content.size[1]} | 網格: {img_size[0]}x{img_size[1]} | 筆刷鍵: {brush_key} | 格距: {cell_step_px} | Spiral: {spiral_state}"
+                stats = preview_stats_text(estimated, total_ops, color_changes)
+                info = f"{label} | {stats} | {pos_text} | 畫布: {canvas_w}x{canvas_h} | 目標區: {int(target_w)}x{int(target_h)} | 網格: {img_size[0]}x{img_size[1]} | 筆刷鍵: {brush_key} | 格距: {cell_step_px} | Spiral: {spiral_state} | Runs: {exact_run_count}->{planned_run_count} ({reduced:.1f}%)"
             else:
                 self.log(f"未知模式：{mode}")
                 return
