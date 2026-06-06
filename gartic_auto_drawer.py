@@ -103,10 +103,7 @@ CUSTOM_RGB_SWATCH_CLICK_DELAY = 0.020
 CUSTOM_RGB_INPUT_CLICK_DELAY = 0.085
 CUSTOM_RGB_INPUT_WRITE_DELAY = 0.075
 CUSTOM_RGB_TYPE_INTERVAL = 0.004
-if getattr(sys, "frozen", False):
-    PROJECT_DIR = Path(sys.executable).resolve().parent
-else:
-    PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parent
 PROFILE_DIR = PROJECT_DIR / "profiles"
 PROFILE_FILE = PROFILE_DIR / "gartic_profiles.json"
 GARTIC_BRUSH_PIXELS = {
