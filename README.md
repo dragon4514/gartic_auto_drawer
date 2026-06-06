@@ -1,45 +1,123 @@
 # Gartic OpenCV Drawer
 
-用 OpenCV + PyAutoGUI 將圖片轉成 Gartic Phone 可繪製的線條、色塊或 RGB 繪圖動作。
+Gartic OpenCV Drawer 是一個用 OpenCV、PyAutoGUI 和 PySide6 製作的 Gartic Phone 自動畫圖工具。它可以把圖片轉成線稿、固定色盤色塊、自訂 RGB 色塊或筆觸渲染，並透過滑鼠與鍵盤事件在 Gartic Phone 畫布上繪製。
 
 > 這是個人輔助工具。使用時請尊重遊戲規則、房間規範與其他玩家體驗。
 
+## 重要提醒
+
+強烈建議在瀏覽器安裝廣告阻擋套件後再使用。Gartic Phone 頁面上的廣告可能造成瀏覽器卡頓，讓滑鼠拖曳、快捷鍵或換色事件被漏掉，最後導致畫出來和預覽不同。
+
+繪製期間不要移動瀏覽器視窗、縮放頁面或切換畫布位置。程式是依照偵測到的螢幕座標操作，畫面位置改變後座標就會失準。
+
 ## 功能
 
-- 自動偵測 Gartic 畫布、固定 18 色色盤、筆刷按鈕與 RGB 面板位置
-- 圖片預覽，先確認轉換效果再開始畫
-- 支援多種繪製模式：
-  - `Smart Line Art` 整合線稿
-  - `Palette Color` 固定色盤上色
-  - `Custom RGB` 自訂 RGB 色
-  - `SBR` 筆觸渲染
-- 支援 `Esc` / Stop 按鈕緊急停止
-- 可調整 CPS、筆刷大小、圖片縮放、線條細節、移動速度、RGB 顏色數
-- `Eye Detail` 可在色盤 / RGB 模式最後補強眼睛細節，避免被底色吃掉
+- 自動偵測 Gartic Phone 畫布、固定 18 色色盤、筆刷按鈕與 RGB 面板位置
+- 圖片預覽，開始前先確認線稿、色塊與實際畫布比例
+- 支援固定色盤、Custom RGB、線稿、深色描邊、SBR 筆觸渲染等模式
+- 支援 `Esc` 與程式內 `STOP` 按鈕緊急停止
+- 支援 Gartic 筆刷快捷鍵，`Brush Key 0` 會使用反引號快捷鍵選擇更細的線
+- 可調整 CPS、筆刷大小、圖片縮放、線條細節、移動速度、RGB 顏色數與 RGB 面板延遲
+- 可保存畫布、色盤、筆刷與 RGB 面板校正設定
+- 可用 Overlay 手動拖曳校正偵測結果
 
-## 安裝
+## 快速開始
+
+如果只想使用程式，建議下載 GitHub Release 內的 `GarticOpenCVDrawer.exe`。如果要改程式或自己打包，請使用原始碼方式執行。
+
+### 使用 EXE
+
+1. 從 Release 下載 `GarticOpenCVDrawer.exe`。
+2. 把 exe 放到你想保存設定檔的資料夾。
+3. 執行 exe。
+4. 第一次保存校正設定時，程式會在 exe 旁邊建立 `profiles/` 資料夾。
+
+### 使用原始碼
 
 建議使用 Python 3.10 以上。
 
 ```powershell
+git clone https://github.com/dragon4514/gartic_auto_drawer.git
+cd gartic_auto_drawer
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-## 執行
-
-```powershell
 python gartic_auto_drawer.py
 ```
 
-## 重要提醒
+## 基本使用流程
 
-建議在瀏覽器安裝廣告阻擋套件後再使用。Gartic Phone 頁面上的廣告可能造成瀏覽器卡頓，進而讓滑鼠拖曳、快捷鍵或換色事件被漏掉，導致畫出來和預覽不同。
+1. 開啟 Gartic Phone 繪圖頁面，確認畫布、色盤、筆刷列都看得到。
+2. 建議先安裝廣告阻擋套件，並關掉會讓頁面卡頓的分頁或程式。
+3. 執行 Gartic OpenCV Drawer。
+4. 點 `Load Image` 載入圖片。
+5. 點 `Auto Detect` 自動偵測畫布、色盤、筆刷與 RGB 面板。
+6. 如果偵測位置不準，使用 Overlay 手動拖曳校正。
+7. 選擇模式並點 `Preview` 檢查效果。
+8. 點 `Draw Fast`，讓 Gartic 視窗保持在前景。
+9. 需要停止時按 `Esc` 或程式裡的 `STOP`。
+
+## 繪圖模式
+
+| 模式 | 用途 | 說明 |
+| --- | --- | --- |
+| `Black Line Art` | 黑色線稿 | 適合簡單線稿與低顏色需求圖片 |
+| `Clean Line` | 精簡線稿 | 會減少雜線，速度通常比細節線稿穩 |
+| `Dark Outline` | 深色描邊 | 從圖片中抓較深的輪廓與陰影 |
+| `Cartoon Color` | 簡化上色 | 用固定 Gartic 色盤做卡通化色塊 |
+| `Palette Color` | 固定色盤全彩 | 使用 Gartic 18 色色盤，穩定、速度快 |
+| `Custom RGB` | 自訂 RGB 顏色 | 顏色還原度較高，但換色較慢、較吃瀏覽器穩定度 |
+| `Line + RGB` | 線稿加 RGB | 先保留輪廓，再補 RGB 色塊 |
+| `SBR` | 筆觸渲染 | 實驗性模式，適合做粗略筆觸效果 |
+
+## 建議設定
+
+### 穩定固定色盤上色
+
+- Mode: `Palette Color`
+- Brush Key: `1`
+- CPS: `300 ~ 500`
+- Line Move ms: `5 ~ 8`
+- Image Scale: `80 ~ 90`
+- Stroke Step: `1`
+- Skip White: 開
+
+如果出現斷線、漏色或沒有換色，先把 `Line Move ms` 拉高，或把 CPS 降低。
+
+### RGB 還原度較高
+
+- Mode: `Custom RGB` 或 `Line + RGB`
+- Custom Colors: `16 ~ 64`
+- Brush Key: `1`
+- CPS: `120 ~ 250`
+- Line Move ms: `6 ~ 10`
+- RGB Panel ms: `300` 以上
+
+Custom RGB 最高支援到 384 色，但顏色越多，換色次數越多，也越容易受瀏覽器卡頓影響。一般圖片建議先用 24、48 或 64 色測試。
+
+使用 RGB 模式前，請先打開 Gartic 的自訂色面板，再重新 `Auto Detect`。如果別人的電腦解析度或瀏覽器縮放不同，請用 Overlay 手動校正 RGB 色塊與 R/G/B 輸入框。
+
+### 線稿
+
+- Mode: `Smart Line Art`、`Clean Line` 或 `Dark Outline`
+- Brush Key: `0 ~ 2`
+- Line Detail: `3 ~ 5`
+- Line Move ms: `5 ~ 12`
+- Stroke Step: `1`
+
+`Brush Key 0` 是額外細線，會先讓 Gartic 視窗取得焦點，再按反引號快捷鍵。若快捷鍵沒有生效，請確認 Gartic 視窗在繪製時保持前景。
+
+## 設定檔
+
+校正資料會存在 `profiles/gartic_profiles.json`。
+
+原始碼執行時，`profiles/` 會建立在專案資料夾內。exe 執行時，`profiles/` 會建立在 exe 所在資料夾內。這樣別人下載後可以在自己的資料夾保存自己的螢幕座標，不會套用到你的本機路徑。
+
+`profiles/` 已加入 `.gitignore`，不會提交到 GitHub。
 
 ## 打包 EXE
 
-專案已提供 PyInstaller 設定檔，可用下面指令重新產生單檔 Windows exe：
+專案提供 PyInstaller 設定檔。安裝依賴後，可用下面指令重新產生單檔 Windows exe：
 
 ```powershell
 python -m pip install pyinstaller
@@ -48,82 +126,76 @@ python -m PyInstaller --noconfirm --clean GarticOpenCVDrawer.spec
 
 輸出檔會在 `dist/GarticOpenCVDrawer.exe`。`dist/` 和 `build/` 已加入 `.gitignore`，建議把 exe 放到 GitHub Release assets，不直接提交到 repo。
 
-## 使用方式
-
-1. 開啟 Gartic Phone 繪圖頁面，確認畫布、色盤、筆刷列都看得到。
-2. 執行程式並點 `Load Image` 載入圖片。
-3. 點 `Auto Detect` 自動偵測畫布、色盤與筆刷位置。
-4. 選擇模式並點 `Preview` 先看效果。
-5. 點 `Draw Fast`，在倒數期間切回 Gartic 視窗。
-6. 需要停止時按 `Esc` 或程式裡的 `STOP`。
-
-## 設定檔
-
-畫布 / 色盤 / 筆刷 / RGB 校正設定會儲存在專案資料夾內的 `profiles/gartic_profiles.json`。
-
-`profiles/` 資料夾會在第一次保存設定檔時自動產生，並已加入 `.gitignore`，避免把個人螢幕座標上傳到 GitHub。別人下載專案後，也會在自己的專案資料夾內產生自己的設定檔。
-
-## 建議設定
-
-### 穩定色盤上色
-
-- Mode: `Palette Color`
-- Brush Key: `1`
-- CPS: `300 ~ 500`
-- Line Move ms: `5 ~ 8`
-- Image Scale: `80 ~ 90`
-- Skip White: 開
-
-如果出現斷線或沒有換色，先把 `Line Move ms` 拉高、CPS 降低。
-
-### RGB 還原度較高
-
-- Mode: `Custom RGB`
-- Custom Colors: `16 ~ 32`
-- Brush Key: `1`
-- CPS: `120 ~ 250`
-- Line Move ms: `6 ~ 10`
-
-使用 RGB 模式前，請先打開 Gartic 的自訂色面板，再重新 `Auto Detect`。
-
-### 線稿
-
-- Mode: `Smart Line Art`
-- Brush Key: `1 ~ 2`
-- Line Detail: `3 ~ 5`
-- Stroke Step: `1`
-
 ## 常見問題
+
+### Auto Detect 找不到畫布
+
+- 確認 Gartic Phone 繪圖頁面在螢幕上可見。
+- 不要讓其他視窗遮住畫布、色盤或筆刷列。
+- 瀏覽器縮放建議先用 100%。
+- 如果偵測到的位置不準，使用 Overlay 手動校正並保存 profile。
 
 ### 顏色沒有切換
 
-- 固定色盤模式：重新 `Auto Detect`，確認色盤沒有被視窗遮住。
-- RGB 模式：確認自訂色面板已打開，且 RGB 輸入框位置沒有被遮擋。
-- 降低 CPS 或提高 `Line Move ms`，瀏覽器太忙時可能會漏掉滑鼠/鍵盤事件。
+- 固定色盤模式：重新 `Auto Detect`，確認色盤沒有被遮住。
+- RGB 模式：確認自訂色面板已打開，且 R/G/B 輸入框位置正確。
+- 提高 `RGB Panel ms` 和 `Line Move ms`。
+- 降低 CPS，瀏覽器太忙時可能漏掉點擊、拖曳或鍵盤事件。
 
 ### 畫出來和預覽不一樣
 
 - 繪製期間不要移動瀏覽器視窗或縮放頁面。
-- Gartic / 瀏覽器可能漏掉太快的拖曳事件，先用較穩的速度測試。
-- `Skip White` 會保留白色畫布，因此原圖的白色高光可能不會被畫出。
+- 安裝廣告阻擋套件，避免廣告造成頁面卡頓。
+- 預覽是根據筆刷大小估算的結果，Gartic 實際筆刷、瀏覽器縮放與拖曳事件採樣都可能造成差異。
+- `Skip White` 會保留白色畫布，因此原圖的白色高光、文字或空洞可能不會被畫出。
+
+### 線條或色塊斷掉
+
+- 把 `Line Move ms` 調高。
+- 把 CPS 降低。
+- 使用較大的 Brush Key。
+- 避免在 CPU 很忙或瀏覽器很卡的時候繪製。
 
 ### 想更快
 
-- 提高 CPS。
+- 提高 CPS，但 300 以上不保證每台電腦都穩。
 - 降低 `Line Move ms`。
 - 降低 `Image Scale`。
-- 使用較大的 Brush Key，但細節會變少。
+- 使用較大的 Brush Key。
+- 減少 Custom RGB 顏色數。
 
 ## 專案結構
 
-- `gartic_auto_drawer.py`：相容入口檔，保留 `python gartic_auto_drawer.py` 的啟動方式
-- `gartic_drawer/app.py`：Qt 主視窗、按鈕事件、預覽與繪製流程
-- `gartic_drawer/config.py`：模式名稱、預設值、Gartic 色盤、筆刷與設定檔路徑
-- `gartic_drawer/detection.py`：畫布、色盤、筆刷按鈕與 RGB 面板偵測
-- `gartic_drawer/image_processing.py`：圖片縮放、量化、線稿、色塊、SBR 與預覽渲染
-- `gartic_drawer/automation.py`：滑鼠/鍵盤操作、路徑排序、色塊填充路徑
-- `gartic_drawer/ui/`：可重用 Qt 元件與校正 Overlay
-- `GarticOpenCVDrawer.spec`：PyInstaller 打包設定
-- `requirements.txt`：Python 依賴套件
-- `profiles/gartic_profiles.json`：本機自動產生的畫布設定檔，不會提交到 Git
-- `.gitignore`：忽略快取、虛擬環境與本機測試輸出
+```text
+gartic_auto_drawer.py          相容入口檔，保留原本啟動方式
+GarticOpenCVDrawer.spec        PyInstaller 打包設定
+requirements.txt               Python 依賴套件
+gartic_drawer/
+  app.py                       Qt 主視窗、事件、預覽與繪製流程
+  automation.py                滑鼠/鍵盤操作、路徑排序、填色路徑
+  common.py                    共用例外與 UI yield helper
+  config.py                    模式名稱、預設值、色盤、筆刷與設定檔路徑
+  detection.py                 畫布、色盤、筆刷與 RGB 面板偵測
+  image_processing.py          圖片縮放、量化、線稿、色塊、預覽與 SBR
+  ui/
+    overlays.py                偵測校正與圖片位置 Overlay
+    widgets.py                 可重用 Qt 元件
+```
+
+## 開發檢查
+
+修改程式後可先執行：
+
+```powershell
+python -m compileall -q gartic_auto_drawer.py gartic_drawer
+python -c "import gartic_auto_drawer; print('import ok')"
+```
+
+這只能檢查語法與基本匯入，實際畫布偵測與繪圖仍建議在 Gartic Phone 測試。
+
+## 注意事項
+
+- 本工具依賴螢幕座標與瀏覽器事件，不是 Gartic Phone 官方 API。
+- 不同解析度、瀏覽器縮放、Windows 顯示比例都可能需要重新校正。
+- 高 CPS 不代表 Gartic 一定能接收所有事件，穩定度通常比極限速度重要。
+- 請不要在公開房間濫用，避免影響其他玩家。
