@@ -4,6 +4,43 @@ Gartic OpenCV Drawer 是一個用 OpenCV、PyAutoGUI 和 PySide6 製作的 Garti
 
 > 這是個人輔助工具。使用時請尊重遊戲規則、房間規範與其他玩家體驗。
 
+## 下載與啟動
+
+### 推薦：下載 EXE
+
+最簡單的使用方式是到 GitHub Releases 下載 `GarticOpenCVDrawer.exe`。
+
+1. 下載 `GarticOpenCVDrawer.exe`。
+2. 放到你想保存設定檔的資料夾。
+3. 雙擊執行。
+
+第一次保存校正設定時，程式會在 exe 旁邊建立 `profiles/` 資料夾。
+
+> GitHub 的 Code 頁面只放原始碼。exe 檔案建議放在 Releases 的 Assets，不直接提交到 repo。
+
+### 下載原始碼 ZIP
+
+如果你是從 Code -> Download ZIP 下載原始碼，解壓縮後雙擊：
+
+```text
+run_gartic_drawer.bat
+```
+
+這個啟動檔會自動建立 `.venv`、安裝 `requirements.txt`，再啟動程式。第一次執行需要網路下載 Python 套件，會比較久。
+
+如果電腦沒有 Python，啟動檔會提示先安裝 Python 3.10 以上。
+
+### 手動執行原始碼
+
+```powershell
+git clone https://github.com/dragon4514/gartic_auto_drawer.git
+cd gartic_auto_drawer
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+python gartic_auto_drawer.py
+```
+
 ## 重要提醒
 
 強烈建議在瀏覽器安裝廣告阻擋套件後再使用。Gartic Phone 頁面上的廣告可能造成瀏覽器卡頓，讓滑鼠拖曳、快捷鍵或換色事件被漏掉，最後導致畫出來和預覽不同。
@@ -21,39 +58,12 @@ Gartic OpenCV Drawer 是一個用 OpenCV、PyAutoGUI 和 PySide6 製作的 Garti
 - 可保存畫布、色盤、筆刷與 RGB 面板校正設定
 - 可用 Overlay 手動拖曳校正偵測結果
 
-## 快速開始
+## 系統需求
 
-如果只想使用程式，建議下載 GitHub Release 內的 `GarticOpenCVDrawer.exe`。如果要改程式或自己打包，請使用原始碼方式執行。
-
-### 使用 EXE
-
-1. 從 Release 下載 `GarticOpenCVDrawer.exe`。
-2. 把 exe 放到你想保存設定檔的資料夾。
-3. 執行 exe。
-4. 第一次保存校正設定時，程式會在 exe 旁邊建立 `profiles/` 資料夾。
-
-### 使用原始碼
-
-建議使用 Python 3.10 以上。
-
-下載原始碼 ZIP 並解壓縮後，可以直接雙擊：
-
-```text
-run_gartic_drawer.bat
-```
-
-啟動檔會自動建立 `.venv`、安裝 `requirements.txt`，再啟動程式。
-
-如果想手動執行，也可以使用：
-
-```powershell
-git clone https://github.com/dragon4514/gartic_auto_drawer.git
-cd gartic_auto_drawer
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-python gartic_auto_drawer.py
-```
+- Windows 10 / 11
+- 瀏覽器可正常開啟 Gartic Phone
+- 原始碼版本需要 Python 3.10 以上
+- 第一次使用原始碼啟動檔時需要網路安裝 Python 套件
 
 ## 基本使用流程
 
